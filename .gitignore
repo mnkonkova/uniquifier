@@ -12,3 +12,4 @@ noise/pack/
 .DS_Store
 *.mp3
 *.wav
+*.log
