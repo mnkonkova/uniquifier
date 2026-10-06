@@ -16,7 +16,7 @@
   КАК       ``--levers``: какие рычаги включить (через запятую):
               рамка   приближение 5–14% со сдвигом окна — главный рычаг;
               наклон  ±0.5° — расширяет набор обликов, титры чуть завалены;
-              скорость ступени 0.96 / 1.00 / 1.04, высота голоса не меняется —
+              скорость ступени 0.92…1.08 через 4%, высота голоса не меняется —
                       для картинки слабая, для звука сильная: разница 4% между
                       роликами с общим голосом — 91% → 28% совпавших отрезков;
               тон     высота голоса −3% или +3% с сохранением тембра — главный
@@ -629,16 +629,16 @@ def gate_and_repair(out: Path, folders: list[Path], srcs: list[Path], per: dict[
             vw = voice_weights(similar(), [p.stem for p in srcs])
             pitches = cfg["pitch"]["levels"] if "pitch" in levers else [1.0]
             speeds = cfg["speed"]["levels"] if "speed" in levers else [1.0]
-            own = [by_label[_stem(r["a"], multi)] for r in failed if r["kind"] == "оригинал"]
-            pair_rows = [r for r in failed if r["kind"] != "оригинал"]
-            fix = list(dict.fromkeys(own + repair_targets(pair_rows, by_label, multi)))
-            pairs = [(_stem(r["a"], multi), _stem(r["b"], multi)) for r in pair_rows]
-            for i in fix:
-                me = label(srcs[i], multi)
-                partners = {by_label[b if a == me else a] for a, b in pairs if me in (a, b)}
-                per[i] = revoice(i, per, vw, partners, pitches, speeds)
+            rows = json.loads(audio_report.read_text())
+            changed = optimize_voice(per, rows, by_label, multi, vw, pitches, speeds, limit)
+            if not changed:
+                print("Перебор голосов не нашёл улучшения — оставшиеся пары не разводятся.",
+                      flush=True)
+                break
+            print(f"Перебор голосов: меняю голос у {len(changed)} роликов", flush=True)
+            for i in sorted(changed):
                 render(srcs[i], target(i), per[i], cfg)
-                print(f"  пересобран {me}: {per[i].describe()}", flush=True)
+                print(f"  пересобран {label(srcs[i], multi)}: {per[i].describe()}", flush=True)
             save_plan(out, per, srcs, multi)
 
     report = out / "dedup_report.json"
@@ -670,6 +670,75 @@ def run_audio_gate(folders: list[Path], originals: list[Path] | None, report: Pa
     for ref in originals or []:
         cmd += ["--originals", str(ref)]
     return subprocess.run(cmd).returncode
+
+
+def optimize_voice(per: dict[int, Look], rows: list[dict], by_label: dict[str, int],
+                   multi: bool, fallback: Weights, pitches: list[float], speeds: list[float],
+                   limit: float, passes: int = 30) -> set[int]:
+    """Перебор голосов по ЗАМЕРЕННОМУ сходству — без пересборки, в расчёте.
+
+    Отчёт гейта даёт сходство каждой пары с общим голосом при её нынешних
+    голосах. Делим на ``voice_overlap`` этих голосов — получаем, сколько голоса
+    пара делит вообще (если голоса и так далеки, деление ненадёжно — тогда
+    берётся оценка по именам). Дальше локальный поиск: каждому ролику из
+    конфликтов — вариант, при котором предсказанных пар за порогом (с запасом)
+    меньше всего; круги, пока что-то меняется. Пересобираются только
+    изменившиеся ролики — один раз за круг гейта, а не по ролику на пару.
+
+    Прежняя починка (по одному ролику на пару, оценка по именам) не сходилась:
+    629 пар → 602 после круга — перекрашенный ролик садился на соседей.
+    """
+    target = limit * 0.8
+    options = voice_options(pitches, speeds)
+    cur = {i: (l.pitch, l.speed) for i, l in per.items()}
+    base: dict[int, dict[int, float]] = {}
+    hot: set[int] = set()
+    for r in rows:
+        a, b = by_label.get(_stem(r["a"], multi)), by_label.get(_stem(r["b"], multi))
+        if r["kind"] == "оригинал":
+            if a is not None and r["pct"] > limit:
+                hot.add(a)
+            continue
+        if a is None or b is None or a not in cur or b not in cur:
+            continue
+        ov = voice_overlap(*cur[a], *cur[b])
+        shared = r["pct"] / ov if ov >= 0.1 else max(fallback[a].get(b, 0.0), r["pct"])
+        shared = min(100.0, shared)
+        base.setdefault(a, {})[b] = base.setdefault(b, {})[a] = shared
+        if r["pct"] > limit:
+            hot |= {a, b}
+
+    def local(i: int, o: tuple[float, float]) -> tuple[int, float]:
+        bad, total = 0, ORIGINAL_WEIGHT * voice_overlap(o[0], o[1], 1.0, 1.0)
+        for j, sh in base.get(i, {}).items():
+            pred = sh * voice_overlap(o[0], o[1], *cur[j])
+            bad += pred > target
+            total += pred
+        return bad, total
+
+    changed: set[int] = set()
+    # Пересматриваются ВСЕ ролики с общим голосом, а не только конфликтные:
+    # расчёт на 450 роликах — по конфликтным 497 → 494 пар, по всем — до ~200
+    # (при скорости ±8%). Ролик, которому замена не помогает, остаётся как есть.
+    for i, o in cur.items():
+        if o not in options:          # голос из старых ступеней — пересмотреть
+            hot.add(i)
+    todo = sorted(set(base) | hot, key=lambda k: -len(base.get(k, {})))
+    for _ in range(passes):
+        moved = False
+        for i in todo:
+            best = min(options, key=lambda o: (local(i, o), o != cur[i]))
+            if best != cur[i] and (local(i, best) < local(i, cur[i]) or cur[i] not in options):
+                cur[i] = best
+                changed.add(i)
+                moved = True
+        if not moved:
+            break
+    for i in changed:
+        old = per[i]
+        per[i] = Look(look=old.look, zoom=old.zoom, ox=old.ox, oy=old.oy, tilt=old.tilt,
+                      speed=cur[i][1], gop=old.gop, pitch=cur[i][0])
+    return changed
 
 
 def revoice(i: int, per: dict[int, Look], weights: Weights, partners: set[int],
