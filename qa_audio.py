@@ -123,10 +123,17 @@ def main() -> int:
         fps = dict(zip(new, ex.map(fingerprint, new)))
         ofps = dict(zip(originals.values(), ex.map(fingerprint, originals.values())))
 
+    # Ролик без звуковой дорожки (у сырых файлов это обычное дело) звуком ни на
+    # кого не похож — в сравнение не идёт, но перечисляется.
+    silent = [p for p in new if len(fps[p]) == 0]
+    if silent:
+        print(f"Без звука (пропущены): {len(silent)}: " + ", ".join(label(p) for p in silent[:10])
+              + (" …" if len(silent) > 10 else ""))
+    new = [p for p in new if len(fps[p])]
     rows = []
     for p in new:
         o = originals.get(p.name)
-        if o is not None:
+        if o is not None and len(ofps[o]):
             rows.append(("оригинал", label(p), label(o), matched_pct(fps[p], ofps[o])))
     pairs = [(a, b) for i, a in enumerate(new) for b in new[i + 1:] if shares_block(a.stem, b.stem)]
     print(f"Пар с общим куском: {len(pairs)}", flush=True)

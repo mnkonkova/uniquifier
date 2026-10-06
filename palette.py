@@ -1,7 +1,11 @@
 """Подбор набора «обликов» (рамка ± наклон) под конкретный материал.
 
-Облик = (приближение z, окно x, y, наклон t). Кадр увеличивается до W·z × H·z,
-поворачивается на t вокруг центра и из него вырезается окно 1080×1920 в (x, y).
+Облик = (приближение z, сдвиг ox, oy, наклон t) — в ДОЛЯХ кадра, поэтому один
+и тот же облик годится для любого размера и соотношения сторон. Кадр w×h
+увеличивается до w·z × h·z (пропорции сохраняются), поворачивается на t вокруг
+центра, и из него вырезается окно w×h с левым верхним углом в (ox·w, oy·h).
+Выход — того же размера, что и исходник: вертикальный остаётся вертикальным,
+горизонтальный — горизонтальным.
 
 Набор подбирается перебором ПО КАДРАМ САМИХ ИСХОДНИКОВ: два облика совместимы,
 если ни один кадр выборки, показанный в одном облике, не ближе 31 бита PDQ к
@@ -25,81 +29,98 @@ from pathlib import Path
 
 import numpy as np
 
-W, H = 1080, 1920
-# Геометрия считается на половинном кадре: PDQ всё равно сводит кадр к 64×64,
-# а перебор так идёт вчетверо быстрее.
-SCALE = 0.5
-ZOOMS = (1.05, 1.06, 1.07, 1.08, 1.09, 1.10, 1.11, 1.12, 1.13, 1.14)
-X_STEP, Y_STEP = 12, 24
+ZOOMS = (1.03, 1.04, 1.05, 1.06, 1.07, 1.08, 1.09, 1.10, 1.11, 1.12, 1.13, 1.14)
+# Шаг сдвига окна в долях кадра (на 1080×1920 — 12 и 24 px, как прежде).
+X_STEP, Y_STEP = 12 / 1080, 24 / 1920
 TILTS = (-0.5, 0.5)
-PALETTE_VERSION = 2     # меняется вместе с правилами перебора — сбрасывает кэш
+SAMPLE_WIDTH = 540        # кадры выборки — в этой ширине, пропорции свои
+PALETTE_VERSION = 3       # меняется вместе с правилами перебора — сбрасывает кэш
 
 
 @dataclass(frozen=True)
 class Limits:
-    text_box: tuple[int, int, int, int] = (95, 1306, 994, 1619)   # титры: l, t, r, b
-    text_margin: int = 8
-    max_top: int = 150          # сколько можно срезать сверху, px
-    max_bottom: int = 230
+    """Что нельзя срезать — в долях кадра.
+
+    ``text_box`` — прямоугольник титров (l, t, r, b), None — титры не защищаются.
+    ``max_top``/``max_bottom``/``max_side`` — сколько кадра можно потерять с
+    каждой стороны.
+    """
+    text_box: tuple[float, float, float, float] | None = None
+    text_margin: float = 0.0
+    max_top: float = 1.0
+    max_bottom: float = 1.0
+    max_side: float = 1.0
 
 
-def scaled_size(z: float) -> tuple[int, int]:
-    return round(W * z / 2) * 2, round(H * z / 2) * 2
+def even(v: float) -> int:
+    return max(2, round(v / 2) * 2)
 
 
-def to_out(px: float, py: float, look: tuple) -> tuple[float, float]:
-    """Точка исходного кадра → где она окажется в готовом кадре."""
-    z, x, y, t = look
-    w, h = scaled_size(z)
-    sx, sy = px * w / W, py * h / H
-    cx, cy = w / 2, h / 2
+def to_out(u: float, v: float, look: tuple, aspect: float) -> tuple[float, float]:
+    """Точка исходного кадра (доли u, v) → где она окажется в готовом кадре (доли).
+
+    Считается в единицах «высота кадра = 1, ширина = aspect».
+    """
+    z, ox, oy, t = look
+    w, h = aspect, 1.0
+    sx, sy = u * w * z, v * h * z
+    cx, cy = w * z / 2, h * z / 2
     th = math.radians(t)
     dx, dy = sx - cx, sy - cy
-    return (cx + dx * math.cos(th) - dy * math.sin(th) - x,
-            cy + dx * math.sin(th) + dy * math.cos(th) - y)
+    x = cx + dx * math.cos(th) - dy * math.sin(th) - ox * w
+    y = cy + dx * math.sin(th) + dy * math.cos(th) - oy * h
+    return x / w, y / h
 
 
-def no_black_corners(look: tuple) -> bool:
+def no_black_corners(look: tuple, aspect: float) -> bool:
     """Углы окна лежат внутри повёрнутого увеличенного кадра."""
-    z, x, y, t = look
-    w, h = scaled_size(z)
-    if x < 0 or y < 0 or x + W > w or y + H > h:
+    z, ox, oy, t = look
+    w, h = aspect, 1.0
+    if ox < 0 or oy < 0 or ox + 1 > z + 1e-9 or oy + 1 > z + 1e-9:
         return False
-    cx, cy = w / 2, h / 2
+    cx, cy = w * z / 2, h * z / 2
     th = math.radians(-t)
-    for qx, qy in ((x, y), (x + W, y), (x, y + H), (x + W, y + H)):
+    eps = 1e-3 * h
+    for qx, qy in ((ox * w, oy * h), ((ox + 1) * w, oy * h),
+                   (ox * w, (oy + 1) * h), ((ox + 1) * w, (oy + 1) * h)):
         dx, dy = qx - cx, qy - cy
         ux = dx * math.cos(th) - dy * math.sin(th)
         uy = dx * math.sin(th) + dy * math.cos(th)
-        if abs(ux) > w / 2 - 1 or abs(uy) > h / 2 - 1:
+        if abs(ux) > w * z / 2 - eps or abs(uy) > h * z / 2 - eps:
             return False
     return True
 
 
-def is_safe(look: tuple, lim: Limits) -> bool:
-    if not no_black_corners(look):
+def is_safe(look: tuple, lim: Limits, aspect: float) -> bool:
+    if not no_black_corners(look, aspect):
         return False
-    l, tp, r, b = lim.text_box
-    for px in (l, r):
-        for py in (tp, b):
-            u, _ = to_out(px, py, look)
-            if not lim.text_margin <= u <= W - lim.text_margin:
-                return False
-    top = -to_out(W / 2, 0, look)[1]
-    bottom = -(H - to_out(W / 2, H, look)[1])
-    return top <= lim.max_top and bottom <= lim.max_bottom
+    if lim.text_box is not None:
+        l, tp, r, b = lim.text_box
+        for u in (l, r):
+            for v in (tp, b):
+                x, _ = to_out(u, v, look, aspect)
+                if not lim.text_margin <= x <= 1 - lim.text_margin:
+                    return False
+    top = -to_out(0.5, 0, look, aspect)[1]
+    bottom = to_out(0.5, 1, look, aspect)[1] - 1
+    left = -to_out(0, 0.5, look, aspect)[0]
+    right = to_out(1, 0.5, look, aspect)[0] - 1
+    return (top <= lim.max_top + 1e-9 and bottom <= lim.max_bottom + 1e-9
+            and left <= lim.max_side + 1e-9 and right <= lim.max_side + 1e-9)
 
 
-def candidates(tilt: bool, lim: Limits) -> list[tuple]:
+def candidates(tilt: bool, lim: Limits, aspects: list[float]) -> list[tuple]:
+    """Облики, безопасные для ВСЕХ соотношений сторон партии."""
     tilts = (0.0,) + (TILTS if tilt else ())
     out = []
     for t in tilts:
         for z in ZOOMS:
-            w, h = scaled_size(z)
-            for x in range(0, w - W + 1, X_STEP):
-                for y in range(0, h - H + 1, Y_STEP):
-                    look = (z, x, y, t)
-                    if is_safe(look, lim):
+            nx = int((z - 1) / X_STEP + 1e-9)
+            ny = int((z - 1) / Y_STEP + 1e-9)
+            for i in range(nx + 1):
+                for j in range(ny + 1):
+                    look = (z, round(i * X_STEP, 5), round(j * Y_STEP, 5), t)
+                    if all(is_safe(look, lim, a) for a in aspects):
                         out.append(look)
     return out
 
@@ -108,11 +129,27 @@ def candidates(tilt: bool, lim: Limits) -> list[tuple]:
 _FRAMES: list = []
 
 
+def video_dims(path: Path) -> tuple[int, int]:
+    """Размер кадра с учётом поворота из метаданных (как его покажет плеер)."""
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+         "stream=width,height:stream_side_data=rotation", "-of", "json", str(path)],
+        capture_output=True, text=True).stdout
+    st = json.loads(out or "{}").get("streams", [{}])[0]
+    w, h = int(st.get("width", 0)), int(st.get("height", 0))
+    rot = next((abs(int(sd.get("rotation", 0))) for sd in st.get("side_data_list", [])
+                if "rotation" in sd), 0)
+    return (h, w) if rot % 180 == 90 else (w, h)
+
+
 def sample_frames(videos: list[Path], per_video: int = 12) -> list[np.ndarray]:
-    """По per_video кадров из каждого ролика, равномерно по длине, в половинном размере."""
+    """По per_video кадров из каждого ролика, равномерно по длине, ширина 540."""
     frames = []
-    w, h = int(W * SCALE), int(H * SCALE)
     for v in videos:
+        vw, vh = video_dims(v)
+        if not vw or not vh:
+            continue
+        w, h = SAMPLE_WIDTH, even(SAMPLE_WIDTH * vh / vw)
         raw = subprocess.run(
             ["ffmpeg", "-v", "error", "-i", str(v), "-vf", f"fps=1,scale={w}:{h}",
              "-f", "rawvideo", "-pix_fmt", "rgb24", "-"], capture_output=True).stdout
@@ -136,35 +173,46 @@ def _init(frames):
     _FRAMES = frames
 
 
+def apply_look(im, look: tuple):
+    """Облик на PIL-картинке — та же геометрия, что у ffmpeg в рендере."""
+    from PIL import Image
+
+    z, ox, oy, t = look
+    w0, h0 = im.size
+    w, h = even(w0 * z), even(h0 * z)
+    im = im.resize((w, h), Image.BILINEAR)
+    if t:
+        # PIL крутит против часовой, ffmpeg rotate — по часовой.
+        im = im.rotate(-t, resample=Image.BILINEAR, center=(w / 2, h / 2))
+    x, y = round(ox * w0), round(oy * h0)
+    return im.crop((x, y, x + w0, y + h0))
+
+
 def _hash_look(look: tuple) -> np.ndarray:
     import pdqhash
     from PIL import Image
 
-    z, x, y, t = look
-    w, h = (round(v * SCALE) for v in scaled_size(z))
     out = []
     for a in _FRAMES:
-        im = Image.fromarray(a).resize((w, h), Image.BILINEAR)
-        if t:
-            # PIL крутит против часовой, ffmpeg rotate — по часовой.
-            im = im.rotate(-t, resample=Image.BILINEAR, center=(w / 2, h / 2))
-        sx, sy = round(x * SCALE), round(y * SCALE)
-        im = im.crop((sx, sy, sx + int(W * SCALE), sy + int(H * SCALE)))
-        hb, _ = pdqhash.compute(np.asarray(im.resize((270, 480), Image.BILINEAR)))
+        im = apply_look(Image.fromarray(a), look)
+        hb, _ = pdqhash.compute(np.asarray(im))
         out.append(hb.astype(np.int32))
     return np.array(out)
 
 
-def search(videos: list[Path], tilt: bool, lim: Limits, cache_dir: Path,
+def search(videos: list[Path], tilt: bool, lim: Limits, aspects: list[float], cache_dir: Path,
            jobs: int = 12, tries: int = 3000, threshold: int = 31) -> list[tuple]:
     """Максимальный найденный набор попарно совместимых обликов (кэшируется)."""
     key = hashlib.sha1(json.dumps([PALETTE_VERSION, sorted(map(str, videos)), tilt, lim.__dict__,
-                                   ZOOMS, X_STEP, Y_STEP, TILTS, threshold]).encode()).hexdigest()
+                                   sorted(round(a, 4) for a in aspects), ZOOMS, X_STEP, Y_STEP,
+                                   TILTS, threshold]).encode()).hexdigest()
     cache = cache_dir / f"palette_{key}.json"
     if cache.exists():
         return [tuple(x) for x in json.loads(cache.read_text())]
 
-    cands = [(1.0, 0, 0, 0.0)] + candidates(tilt, lim)   # первый — оригинал
+    cands = [(1.0, 0.0, 0.0, 0.0)] + candidates(tilt, lim, aspects)   # первый — оригинал
+    if len(cands) == 1:
+        return []
     frames = sample_frames(videos)
     with ProcessPoolExecutor(jobs, initializer=_init, initargs=(frames,)) as ex:
         hashes = np.stack(list(ex.map(_hash_look, cands, chunksize=4)))

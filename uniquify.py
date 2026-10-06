@@ -52,14 +52,13 @@ import yaml
 import palette
 
 ROOT = Path(__file__).resolve().parent
-W, H, FPS = 1080, 1920, 30
 GOLDEN = 0.6180339887498949
 CACHE = ROOT / "output" / "_cache"
 
 LEVERS = {"рамка": "frame", "наклон": "tilt", "скорость": "speed", "тон": "pitch",
           "frame": "frame", "tilt": "tilt", "speed": "speed", "pitch": "pitch"}
 DEFAULT_LEVERS = "рамка,скорость,тон"
-IDENTITY = (1.0, 0, 0, 0.0)
+IDENTITY = (1.0, 0.0, 0.0, 0.0)
 
 
 def parse_levers(text: str) -> set[str]:
@@ -240,23 +239,57 @@ def assign_pitch(weights: Weights, chosen: list[int], levels: list[float]) -> di
 class Look:
     look: int           # номер облика в наборе; −1 — без рамки
     zoom: float
-    x: int
-    y: int
+    ox: float           # сдвиг окна — в долях кадра (см. palette.py)
+    oy: float
     tilt: float
     speed: float
     gop: int
     pitch: float = 1.0
 
+    @classmethod
+    def from_plan(cls, d: dict) -> "Look":
+        """Из plan.json; старые планы хранили сдвиг в пикселях кадра 1080×1920."""
+        d = dict(d)
+        if "x" in d:
+            d["ox"], d["oy"] = d.pop("x") / 1080, d.pop("y") / 1920
+        d.pop("noise", None)
+        d.pop("noise_opacity", None)
+        return cls(**d)
+
     def describe(self) -> str:
         parts = []
         if self.look >= 0:
             tilt = f", наклон {self.tilt:+.1f}°" if self.tilt else ""
-            parts.append(f"облик #{self.look:02d} (×{self.zoom:.2f} @ {self.x},{self.y}{tilt})")
+            parts.append(f"облик #{self.look:02d} (×{self.zoom:.2f}, сдвиг "
+                         f"{100 * self.ox:.1f}%/{100 * self.oy:.1f}%{tilt})")
         if self.speed != 1.0:
             parts.append(f"скорость {self.speed:.3f}")
         if self.pitch != 1.0:
             parts.append(f"тон {100 * (self.pitch - 1):+.0f}%")
         return ", ".join(parts) or "без изменений"
+
+
+@dataclass(frozen=True)
+class Media:
+    width: int          # как показывает плеер (поворот из метаданных учтён)
+    height: int
+    fps: str            # как у исходника: «30/1», «60000/1001»…
+    has_audio: bool
+
+
+def probe(src: Path) -> Media:
+    out = sh(["ffprobe", "-v", "error", "-show_entries",
+              "stream=codec_type,width,height,avg_frame_rate", "-of", "json", src],
+             f"ffprobe {src.name}")
+    streams = json.loads(out).get("streams", [])
+    video = next((st for st in streams if st.get("codec_type") == "video"), None)
+    if video is None:
+        raise RuntimeError(f"{src.name}: нет видеодорожки")
+    w, h = palette.video_dims(src)
+    fps = video.get("avg_frame_rate") or "30/1"
+    if fps in ("0/0", "0/1"):
+        fps = "30/1"
+    return Media(w, h, fps, any(st.get("codec_type") == "audio" for st in streams))
 
 
 def audio_filter(look: Look) -> str:
@@ -269,26 +302,47 @@ def audio_filter(look: Look) -> str:
     return ",".join(chain)
 
 
-def build_filter(look: Look) -> str:
-    w, h = palette.scaled_size(look.zoom)
-    chain = [f"[0:v]setpts=PTS/{look.speed}", f"fps={FPS}"]
+def build_filter(look: Look, media: Media) -> str:
+    """Рамка в долях кадра: выход того же размера и пропорций, что исходник.
+
+    Увеличение — по обеим осям одним множителем, поэтому картинка не
+    сплющивается; окно вырезается размером с исходный кадр (чётным — так
+    требует yuv420p).
+    """
+    w0, h0 = palette.even(media.width), palette.even(media.height)
+    chain = [f"[0:v]setpts=PTS/{look.speed}", f"fps={media.fps}"]
     if look.look >= 0:
+        w, h = palette.even(w0 * look.zoom), palette.even(h0 * look.zoom)
         chain.append(f"scale={w}:{h}:flags=bicubic")
         if look.tilt:
             chain.append(f"rotate={look.tilt}*PI/180:ow=iw:oh=ih:c=black:bilinear=1")
-        chain.append(f"crop={W}:{H}:{look.x}:{look.y}")
+        x = min(round(look.ox * w0), w - w0)
+        y = min(round(look.oy * h0), h - h0)
+        chain.append(f"crop={w0}:{h0}:{x}:{y}")
+    else:
+        chain.append(f"scale={w0}:{h0}")
     chain += ["setsar=1", "format=yuv420p"]
-    return ",".join(chain) + "[v];" + f"[0:a]{audio_filter(look)}[a]"
+    graph = ",".join(chain) + "[v]"
+    if media.has_audio:
+        graph += f";[0:a]{audio_filter(look)}[a]"
+    return graph
+
+
+def render_cmd(src: Path, out: Path, look: Look, media: Media, cfg: dict) -> list:
+    cmd = ["ffmpeg", "-y", "-v", "error", "-i", src,
+           "-filter_complex", build_filter(look, media), "-map", "[v]"]
+    # У сырых файлов звука часто нет — тогда и дорожки в выходе нет.
+    if media.has_audio:
+        cmd += ["-map", "[a]", "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2"]
+    cmd += ["-c:v", "libx264", "-preset", cfg["render"]["preset"], "-crf", cfg["render"]["crf"],
+            "-r", media.fps, "-g", look.gop, "-pix_fmt", "yuv420p",
+            "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709",
+            "-map_metadata", "-1", "-map_chapters", "-1", "-movflags", "+faststart", out]
+    return cmd
 
 
 def render(src: Path, out: Path, look: Look, cfg: dict) -> None:
-    sh(["ffmpeg", "-y", "-v", "error", "-i", src,
-        "-filter_complex", build_filter(look), "-map", "[v]", "-map", "[a]",
-        "-c:v", "libx264", "-preset", cfg["render"]["preset"], "-crf", cfg["render"]["crf"],
-        "-r", FPS, "-g", look.gop, "-pix_fmt", "yuv420p",
-        "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709",
-        "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
-        "-map_metadata", "-1", "-movflags", "+faststart", out], f"рендер {src.name}")
+    sh(render_cmd(src, out, look, probe(src), cfg), f"рендер {src.name}")
 
 
 def next_version(base: Path) -> Path:
@@ -315,30 +369,47 @@ def collect(folders: list[Path], limit: int | None) -> list[Path]:
     return srcs
 
 
-def limits_from(cfg: dict) -> palette.Limits:
+def limits_from(cfg: dict, profile: str | None) -> palette.Limits:
+    """Профиль рамки из config.yaml → framing.profiles (доли кадра)."""
     fr = cfg["framing"]
-    return palette.Limits(text_box=tuple(fr["text_box"]), text_margin=fr["text_margin"],
-                          max_top=fr["max_top"], max_bottom=fr["max_bottom"])
+    name = profile or fr["profile"]
+    if name not in fr["profiles"]:
+        raise SystemExit(f"Нет профиля рамки «{name}». Есть: {', '.join(fr['profiles'])}.")
+    p = fr["profiles"][name]
+    box = p.get("text_box")
+    return palette.Limits(text_box=tuple(box) if box else None,
+                          text_margin=p.get("text_margin", 0.0),
+                          max_top=p.get("max_top", 1.0), max_bottom=p.get("max_bottom", 1.0),
+                          max_side=p.get("max_side", 1.0))
 
 
-def find_looks(srcs: list[Path], levers: set[str], cfg: dict, jobs: int) -> list[tuple]:
+def find_looks(srcs: list[Path], levers: set[str], cfg: dict, jobs: int,
+               profile: str | None = None) -> list[tuple]:
     if "frame" not in levers:
         return [IDENTITY]
+    # Облик должен быть безопасен для каждого соотношения сторон в партии.
+    aspects = sorted({round(w / h, 4) for w, h in map(palette.video_dims, srcs) if w and h})
     # Выборка для перебора — до 10 роликов, равномерно по списку: в неё попадают
     # и говорящая голова, и экран, и мемы.
     step = max(1, len(srcs) // 10)
     sample = srcs[::step][:10]
     print(f"Подбираю облики под материал ({'с наклоном' if 'tilt' in levers else 'без наклона'}, "
           f"выборка {len(sample)} роликов)…", flush=True)
-    return palette.search(sample, "tilt" in levers, limits_from(cfg), CACHE, jobs=jobs)
+    looks = palette.search(sample, "tilt" in levers, limits_from(cfg, profile), aspects,
+                           CACHE, jobs=jobs)
+    if not looks:
+        raise SystemExit("В полях профиля рамки нет облика, который ушёл бы от оригинала "
+                         "(рамка в таких полях слишком слабая). Расширьте поля профиля в "
+                         "config.yaml или уберите рычаг «рамка».")
+    return looks
 
 
 def plan(srcs: list[Path], levers: set[str], count: int | None, allow_shared: bool,
-         threshold: float, cfg: dict, jobs: int):
+         threshold: float, cfg: dict, jobs: int, profile: str | None = None):
     print(f"Сравниваю исходники между собой ({len(srcs)} роликов)…", flush=True)
     raw = similarity(srcs, jobs)
     weights = over(raw, threshold)
-    looks = find_looks(srcs, levers, cfg, jobs)
+    looks = find_looks(srcs, levers, cfg, jobs, profile)
     strict = select_strict(weights, len(looks), count)
     assign = strict
     if allow_shared and count and len(strict) < count:
@@ -357,13 +428,13 @@ def make_looks(raw: Weights, assign: dict[int, int], looks: list[tuple],
     out = {}
     for n, i in enumerate(sorted(assign)):
         c = assign[i]
-        z, x, y, t = looks[c]
+        z, ox, oy, t = looks[c]
         # Скорость считается по номеру ролика ВНУТРИ его облика: у роликов с одним
         # обликом (а их рамка не разводит) скорости разные. Сдвиг 3·облик не даёт
         # первым роликам всех обликов собраться в одно значение.
         r = rank[c] = rank.get(c, -1) + 1
         speed = speed_for(r + 3 * c, sp["min"], sp["max"], sp["dead_zone"]) if "speed" in levers else 1.0
-        out[i] = Look(look=c if "frame" in levers else -1, zoom=z, x=x, y=y, tilt=t,
+        out[i] = Look(look=c if "frame" in levers else -1, zoom=z, ox=ox, oy=oy, tilt=t,
                       speed=speed, gop=15 + (n * 5) % 11, pitch=pitches.get(i, 1.0))
     return out
 
@@ -390,7 +461,7 @@ def cmd_capacity(args: argparse.Namespace, cfg: dict) -> int:
     sets = [("скорость", {"speed"}),
             ("рамка+скорость", {"frame", "speed"}),
             ("+наклон", {"frame", "tilt", "speed"})]
-    sizes = {name: len(find_looks(srcs, lv, cfg, args.jobs)) for name, lv in sets}
+    sizes = {name: len(find_looks(srcs, lv, cfg, args.jobs, args.profile)) for name, lv in sets}
     thresholds = args.thresholds
     print("\nСколько роликов можно сделать уникальными при пороге гейта:")
     print("  " + f"{'рычаги':<22}{'обликов':>8}" + "".join(f"{f'≤{t:g}%':>8}" for t in thresholds))
@@ -412,7 +483,7 @@ def cmd_run(args: argparse.Namespace, cfg: dict) -> int:
     multi = len(args.src) > 1
     threshold = cfg["gate"]["fail_pct"] if args.threshold is None else args.threshold
     raw, weights, looks, strict, assign = plan(srcs, levers, args.count, args.allow_shared,
-                                          threshold, cfg, args.jobs)
+                                               threshold, cfg, args.jobs, args.profile)
     want = min(args.count or len(srcs), len(srcs))
     print(f"\nРычаги: {', '.join(sorted(levers))} · обликов: {len(looks)}")
     print(f"Порог: пара не проходит при >{threshold:g}% общих кадров")
@@ -559,8 +630,8 @@ def relook(i: int, per: dict[int, Look], looks: list[tuple], weights: Weights,
     banned = {per[j].look for j in partners if j in per} | {per[i].look}
     options = [c for c in range(len(looks)) if c not in banned] or list(range(len(looks)))
     c = min(options, key=lambda k: (cost[k], k))
-    z, x, y, t = looks[c]
-    return Look(look=c, zoom=z, x=x, y=y, tilt=t, speed=per[i].speed, gop=per[i].gop,
+    z, ox, oy, t = looks[c]
+    return Look(look=c, zoom=z, ox=ox, oy=oy, tilt=t, speed=per[i].speed, gop=per[i].gop,
                 pitch=per[i].pitch)
 
 
@@ -578,8 +649,10 @@ def cmd_repair(args: argparse.Namespace, cfg: dict) -> int:
     srcs = collect(args.src, None)
     multi = len(args.src) > 1
     by_label = {label(p, multi): i for i, p in enumerate(srcs)}
-    per = {by_label[k]: Look(**v) for k, v in data["videos"].items() if k in by_label}
+    per = {by_label[k]: Look.from_plan(v) for k, v in data["videos"].items() if k in by_label}
     looks = [tuple(x) for x in data["looks"]]
+    if any(x[1] > 1 or x[2] > 1 for x in looks):       # старый план: пиксели 1080×1920
+        looks = [(z, x / 1080, y / 1920, t) for z, x, y, t in looks]
     levers = set(data["levers"])
     threshold = data.get("threshold", cfg["gate"]["fail_pct"]) if args.threshold is None else args.threshold
     folders = [out / f.name for f in args.src] if multi else [out]
@@ -595,6 +668,7 @@ def main() -> int:
     c = sub.add_parser("capacity", help="сколько роликов можно сделать уникальными")
     c.add_argument("src", type=Path, nargs="+")
     c.add_argument("--limit", type=int)
+    c.add_argument("--profile", help="профиль рамки из config.yaml (reels, raw…)")
     c.add_argument("--jobs", type=int, default=10)
     c.add_argument("--thresholds", type=float, nargs="+", default=[0, 5, 10, 20, 30])
 
@@ -612,6 +686,8 @@ def main() -> int:
     r.add_argument("--against", type=Path, action="append",
                    help="ещё сравнить с роликами из этой папки (например, уже выложенными)")
     r.add_argument("--limit", type=int, help="брать не больше N роликов из каждой папки")
+    r.add_argument("--profile", help="профиль рамки из config.yaml: reels — готовые рилсы "
+                                     "(можно срезать зоны интерфейса), raw — сырое видео")
     r.add_argument("--jobs", type=int, default=10, help="процессов для хэширования")
     r.add_argument("--dry-run", action="store_true", help="только показать план")
 

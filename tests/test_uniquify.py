@@ -21,25 +21,67 @@ from uniquify import (  # noqa: E402
     speed_for,
 )
 
-LIM = palette.Limits()
+REELS = palette.Limits(text_box=(0.088, 0.680, 0.920, 0.843), text_margin=0.0074,
+                       max_top=0.078, max_bottom=0.120)
+RAW = palette.Limits(max_top=0.03, max_bottom=0.03, max_side=0.03)
+VERTICAL, HORIZONTAL = 1080 / 1920, 1920 / 1080
 
 
-def test_кандидаты_не_режут_титры_и_не_открывают_углы():
-    for look in palette.candidates(tilt=True, lim=LIM):
-        assert palette.no_black_corners(look), look
-        l, tp, r, b = LIM.text_box
-        for px in (l, r):
-            for py in (tp, b):
-                u, _ = palette.to_out(px, py, look)
-                assert LIM.text_margin <= u <= 1080 - LIM.text_margin, (look, px, py, u)
+def test_облики_рилсов_не_режут_титры_и_не_открывают_углы():
+    for look in palette.candidates(tilt=True, lim=REELS, aspects=[VERTICAL]):
+        assert palette.no_black_corners(look, VERTICAL), look
+        l, tp, r, b = REELS.text_box
+        for u in (l, r):
+            for v in (tp, b):
+                x, _ = palette.to_out(u, v, look, VERTICAL)
+                assert REELS.text_margin <= x <= 1 - REELS.text_margin, (look, u, v, x)
+
+
+def test_облики_сырого_видео_режут_не_больше_3_процентов():
+    looks = palette.candidates(tilt=False, lim=RAW, aspects=[VERTICAL, HORIZONTAL])
+    assert looks
+    for look in looks:
+        for a in (VERTICAL, HORIZONTAL):
+            assert -palette.to_out(0.5, 0, look, a)[1] <= 0.03 + 1e-9
+            assert palette.to_out(1, 0.5, look, a)[0] - 1 <= 0.03 + 1e-9
 
 
 def test_наклон_даёт_больше_кандидатов():
-    assert len(palette.candidates(True, LIM)) > len(palette.candidates(False, LIM))
+    assert (len(palette.candidates(True, REELS, [VERTICAL]))
+            > len(palette.candidates(False, REELS, [VERTICAL])))
 
 
 def test_без_рамки_оригинал_на_месте():
-    assert palette.to_out(100, 200, (1.0, 0, 0, 0.0)) == (100, 200)
+    x, y = palette.to_out(0.1, 0.2, (1.0, 0.0, 0.0, 0.0), HORIZONTAL)
+    assert abs(x - 0.1) < 1e-9 and abs(y - 0.2) < 1e-9
+
+
+def test_горизонтальное_видео_не_сплющивается():
+    from uniquify import Look, Media, build_filter
+
+    look = Look(look=0, zoom=1.1, ox=0.05, oy=0.05, tilt=0.0, speed=1.0, gop=15)
+    graph = build_filter(look, Media(1920, 1080, "25/1", True))
+    assert "scale=2112:1188" in graph          # оба измерения ×1.1
+    assert "crop=1920:1080:96:54" in graph     # выход того же размера, что исходник
+    assert "fps=25/1" in graph
+
+
+def test_видео_без_звука_не_требует_дорожку():
+    from uniquify import Look, Media, render_cmd
+
+    look = Look(look=-1, zoom=1.0, ox=0.0, oy=0.0, tilt=0.0, speed=1.0, gop=15)
+    cfg = {"render": {"preset": "fast", "crf": 20}}
+    cmd = [str(c) for c in render_cmd(Path("a.mp4"), Path("b.mp4"), look,
+                                      Media(1920, 1080, "30/1", False), cfg)]
+    assert "[a]" not in cmd and "[0:a]" not in " ".join(cmd)
+
+
+def test_старый_план_в_пикселях_читается():
+    from uniquify import Look
+
+    look = Look.from_plan({"look": 1, "zoom": 1.1, "x": 108, "y": 192, "tilt": 0.0,
+                           "speed": 1.0, "gop": 15, "noise": None, "noise_opacity": 0.0})
+    assert (look.ox, look.oy) == (0.1, 0.1)
 
 
 def test_имя_разбирается_на_куски():

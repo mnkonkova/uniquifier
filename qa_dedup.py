@@ -44,7 +44,7 @@ MATCH_DISTANCE = 31     # Meta: PDQ DefaultMatchThreshold
 QUALITY_MIN = 50        # Meta vPDQ: quality filter tolerance
 META_COPY_PCT = 80.0    # Meta vPDQ: пример порога «это копия»
 SAMPLE_FPS = 1.0        # Meta vPDQ: «кадр раз в секунду»
-FRAME_W, FRAME_H = 270, 480   # PDQ всё равно сводит кадр к 64×64
+FRAME_W = 270           # PDQ всё равно сводит кадр к 64×64; высота — по пропорциям
 
 
 @dataclass
@@ -68,16 +68,20 @@ def hash_video(path: Path) -> tuple[list[list[int]], list[int]]:
     if cache.exists():
         data = json.loads(cache.read_text())
         return data["bits"], data["quality"]
+    from palette import even, video_dims
+
+    vw, vh = video_dims(path)
+    fw, fh = FRAME_W, even(FRAME_W * vh / vw) if vw else 480
     proc = subprocess.run(
         ["ffmpeg", "-v", "error", "-i", str(path),
-         "-vf", f"fps={SAMPLE_FPS},scale={FRAME_W}:{FRAME_H}",
+         "-vf", f"fps={SAMPLE_FPS},scale={fw}:{fh}",
          "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
         capture_output=True, check=True)
-    frame = FRAME_W * FRAME_H * 3
+    frame = fw * fh * 3
     raw = proc.stdout
     bits, quality = [], []
     for off in range(0, len(raw) - frame + 1, frame):
-        img = np.frombuffer(raw, np.uint8, frame, off).reshape(FRAME_H, FRAME_W, 3)
+        img = np.frombuffer(raw, np.uint8, frame, off).reshape(fh, fw, 3)
         h, q = pdqhash.compute(np.ascontiguousarray(img))
         bits.append([int(b) for b in h])
         quality.append(int(q))
