@@ -10,6 +10,5 @@ noise/pack/
 *.webm
 *.ogv
 .DS_Store
-music/sources/
 *.mp3
 *.wav
