@@ -636,10 +636,7 @@ def gate_and_repair(out: Path, folders: list[Path], srcs: list[Path], per: dict[
                       flush=True)
                 break
             print(f"Перебор голосов: меняю голос у {len(changed)} роликов", flush=True)
-            for i in sorted(changed):
-                render(srcs[i], target(i), per[i], cfg)
-                print(f"  пересобран {label(srcs[i], multi)}: {per[i].describe()}", flush=True)
-            save_plan(out, per, srcs, multi)
+            rerender(sorted(changed), srcs, per, target, out, multi, cfg)
 
     report = out / "dedup_report.json"
     rc = 1
@@ -656,13 +653,43 @@ def gate_and_repair(out: Path, folders: list[Path], srcs: list[Path], per: dict[
             me = label(srcs[i], multi)
             partners = {by_label[b if a == me else a] for a, b in pairs if me in (a, b)}
             per[i] = relook(i, per, looks, similar(), partners)
-            render(srcs[i], target(i), per[i], cfg)
-            print(f"  пересобран {me}: {per[i].describe()}", flush=True)
-        save_plan(out, per, srcs, multi)
+        rerender(fix, srcs, per, target, out, multi, cfg)
     if args.against:
         print("\n── новые ролики против " + ", ".join(map(str, args.against)) + " ──", flush=True)
         rc |= run_gate(folders, threshold, cfg, out / "dedup_vs_against.json", args.against)
     return rc | rc_audio
+
+
+def rerender(indices: list[int], srcs: list[Path], per: dict[int, Look], target,
+             out: Path, multi: bool, cfg: dict) -> None:
+    """Пересобрать ролики параллельно (как основная сборка) и сохранять план
+    после КАЖДОГО — остановка посередине не оставит план и файлы врозь.
+
+    Раньше починка пересобирала по одному: 337 роликов ≈ 11 часов.
+    """
+    import threading
+
+    lock = threading.Lock()
+    done = 0
+
+    def one(i: int) -> None:
+        nonlocal done
+        render(srcs[i], target(i), per[i], cfg)
+        with lock:
+            done += 1
+            save_plan(out, per, srcs, multi)
+            print(f"  [{done}/{len(indices)}] пересобран {label(srcs[i], multi)}: "
+                  f"{per[i].describe()}", flush=True)
+
+    with ThreadPoolExecutor(cfg["render"]["jobs"]) as ex:
+        list(ex.map(one, indices))
+
+
+def broken(path: Path) -> bool:
+    """Файл не читается (например, сборку прервали посреди записи)."""
+    r = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                        "-of", "csv=p=0", str(path)], capture_output=True, text=True)
+    return r.returncode != 0 or not r.stdout.strip()
 
 
 def run_audio_gate(folders: list[Path], originals: list[Path] | None, report: Path) -> int:
@@ -819,6 +846,11 @@ def cmd_repair(args: argparse.Namespace, cfg: dict) -> int:
     levers = set(data["levers"])
     threshold = data.get("threshold", cfg["gate"]["fail_pct"]) if args.threshold is None else args.threshold
     folders = [out / f.name for f in args.src] if multi else [out]
+    target = lambda i: (out / srcs[i].parent.name if multi else out) / srcs[i].name  # noqa: E731
+    bad = [i for i in per if not target(i).exists() or broken(target(i))]
+    if bad:
+        print(f"Недописанных или пропавших файлов: {len(bad)} — пересобираю по плану", flush=True)
+        rerender(bad, srcs, per, target, out, multi, cfg)
     return gate_and_repair(out, folders, srcs, per, looks, threshold, levers, cfg, args, multi)
 
 
