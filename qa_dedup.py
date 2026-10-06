@@ -12,9 +12,9 @@
     сравнение не идут — у них хэш неустойчив;
   * Meta в примере объявляет ролики копией при ≥ 80% совпавших кадров.
 
-Наш порог жёстче: пара НЕ ПРОХОДИТ, если совпал хотя бы один кадр (``--fail-pct
-0``). Как именно Instagram взвешивает частичные совпадения, неизвестно, поэтому
-целимся в ноль, а не в «меньше, чем у Meta».
+Наш порог — ``config.yaml → gate.fail_pct`` (по умолчанию 30%): пара НЕ
+ПРОХОДИТ, если у неё больше этой доли общих кадров. Разово меняется флагом
+``--fail-pct``. Instagram свой порог не публикует.
 
 Официальный пакет ``vpdq`` на macOS не собирается, поэтому сравнение повторено
 здесь поверх ``pdqhash`` (тот же алгоритм PDQ, обёртка над эталонным C++).
@@ -22,7 +22,7 @@
 Usage:
   python qa_dedup.py output/bot_уник                # все пары в папке
   python qa_dedup.py output/bot_уник --against output/bot_тираж
-  python qa_dedup.py output/bot_уник --fail-pct 80  # порог Meta как есть
+  python qa_dedup.py output/bot_уник --fail-pct 0   # строго: ни одного общего кадра
 """
 from __future__ import annotations
 
@@ -153,6 +153,16 @@ def videos_in(folder: Path) -> list[Path]:
                   if p.suffix.lower() in {".mp4", ".mov"} and not p.name.startswith("."))
 
 
+def default_fail_pct() -> float:
+    """Порог из config.yaml — одно место, где его меняют."""
+    import yaml
+
+    try:
+        return float(yaml.safe_load((ROOT / "config.yaml").read_text())["gate"]["fail_pct"])
+    except (OSError, KeyError, TypeError, ValueError):
+        return 30.0
+
+
 def label(path: Path) -> str:
     """Имя ролика вместе с папкой — в нескольких партиях имена могут совпадать."""
     return f"{path.parent.name}/{path.name}"
@@ -165,9 +175,9 @@ def main() -> int:
                     help="папки с готовыми роликами (ролики всех папок сравниваются между собой)")
     ap.add_argument("--against", type=Path, action="append",
                     help="сравнивать с роликами из этой папки (можно несколько раз)")
-    ap.add_argument("--fail-pct", type=float, default=0.0,
+    ap.add_argument("--fail-pct", type=float, default=default_fail_pct(),
                     help="пара не проходит, если совпало больше этой доли кадров, %% "
-                         "(по умолчанию 0 — ни одного общего кадра)")
+                         "(по умолчанию — gate.fail_pct из config.yaml: %(default)g)")
     ap.add_argument("--distance", type=int, default=MATCH_DISTANCE,
                     help="кадры совпадают при расстоянии ≤ N бит (Meta: 31)")
     ap.add_argument("--jobs", type=int, default=8)
