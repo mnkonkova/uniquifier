@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+.pytest_cache/
+output/
+output_run.log
+noise/sources/
+noise/pack/
+*.mp4
+*.mov
+*.webm
+*.ogv
+.DS_Store

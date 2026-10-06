@@ -1,0 +1,4 @@
+numpy>=1.26
+pdqhash>=0.2.8
+pyyaml>=6.0
+pytest>=8.0
