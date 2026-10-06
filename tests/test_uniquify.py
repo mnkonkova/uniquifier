@@ -18,7 +18,6 @@ from uniquify import (  # noqa: E402
     parse_levers,
     select_strict,
     shared_pairs,
-    speed_for,
 )
 
 REELS = palette.Limits(text_box=(0.088, 0.680, 0.920, 0.843), text_margin=0.0074,
@@ -122,13 +121,6 @@ def test_добор_отдаёт_общий_облик_самой_слабой_�
     assert [(i, j) for i, j, _ in shared_pairs(w, full)] == [(1, 2)]
 
 
-def test_скорость_в_коридоре_и_мимо_мёртвой_зоны():
-    for i in range(300):
-        v = speed_for(i, 0.97, 1.03, 0.01)
-        assert 0.97 <= v <= 1.03
-        assert abs(v - 1.0) >= 0.01 - 1e-9
-
-
 def test_расстояние_хэмминга():
     a = np.array([[0, 1, 1, 0]], dtype=np.uint8)
     b = np.array([[1, 1, 0, 0], [0, 1, 1, 0]], dtype=np.uint8)
@@ -143,12 +135,35 @@ def test_починка_берёт_ролик_общий_для_нескольк
     assert repair_targets(failed, idx, multi=True) == [1]
 
 
-def test_тон_разводит_самую_похожую_пару_дальше_всего():
-    from uniquify import assign_pitch
+def test_голос_разводит_самую_похожую_пару_дальше_всего():
+    from uniquify import assign_voice, voice_overlap
 
     w = [{1: 90.0, 2: 5.0}, {0: 90.0}, {0: 5.0}]
-    p = assign_pitch(w, [0, 1, 2], [0.97, 1.0, 1.03])
-    assert abs(p[0] - p[1]) >= 0.06 - 1e-9
+    v = assign_voice(w, [0, 1, 2], [0.97, 1.03], [0.96, 1.0, 1.04])
+    assert voice_overlap(*v[0], *v[1]) < 0.05
+
+
+def test_шесть_роликов_с_общим_голосом_получают_разные_варианты():
+    from uniquify import assign_voice
+
+    w = [{j: 75.0 for j in range(6) if j != i} for i in range(6)]
+    v = assign_voice(w, list(range(6)), [0.94, 0.97, 1.03, 1.06], [0.96, 1.0, 1.04])
+    assert len(set(v.values())) == 6
+
+
+def test_голос_не_выдаётся_слишком_близким_к_оригиналу():
+    from uniquify import MAX_OWN_OVERLAP, voice_options, voice_overlap
+
+    opts = voice_options([0.94, 0.97, 1.03, 1.06], [0.96, 1.0, 1.04])
+    assert (0.97, 1.0) not in opts and (1.03, 1.0) not in opts
+    assert all(voice_overlap(p, s, 1.0, 1.0) <= MAX_OWN_OVERLAP for p, s in opts)
+
+
+def test_общий_кусок_по_имени_даёт_вес_голосу():
+    from uniquify import voice_weights
+
+    w = voice_weights([dict(), dict(), dict()], ["h1_t1_c1", "h1_t1_c2", "h2_t3_c4"])
+    assert w[0][1] == 75.0 and 2 not in w[0]
 
 
 def test_рычаг_тон_по_русски():

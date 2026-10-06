@@ -16,7 +16,9 @@
   КАК       ``--levers``: какие рычаги включить (через запятую):
               рамка   приближение 5–14% со сдвигом окна — главный рычаг;
               наклон  ±0.5° — расширяет набор обликов, титры чуть завалены;
-              скорость ±1–3%, голос не меняет высоту — помогает, но не спасает;
+              скорость ступени 0.96 / 1.00 / 1.04, высота голоса не меняется —
+                      для картинки слабая, для звука сильная: разница 4% между
+                      роликами с общим голосом — 91% → 28% совпавших отрезков;
               тон     высота голоса −3% или +3% с сохранением тембра — главный
                       рычаг для звука (против оригинала 36% → 12% совпавших
                       отрезков Chromaprint), на слух не заметен.
@@ -188,20 +190,6 @@ def shared_pairs(weights: Weights, assign: dict[int, int]) -> list[tuple[int, in
                    if j in assign and i < j and assign[i] == assign[j]), key=lambda t: -t[2])
 
 
-def speed_for(index: int, lo: float, hi: float, dead_zone: float) -> float:
-    """Скорость из коридора по золотому сечению — ровно, без кучкования.
-
-    Середина коридора (|v−1| < dead_zone) выкидывается: половина коридора
-    отображается на [lo, 1−dz], половина на [1+dz, hi].
-    """
-    u = (index * GOLDEN) % 1.0
-    if u < 0.5:
-        v = lo + (1 - dead_zone - lo) * (u / 0.5)
-    else:
-        v = 1 + dead_zone + (hi - 1 - dead_zone) * ((u - 0.5) / 0.5)
-    return round(v, 3)
-
-
 def sh(cmd: list, what: str) -> str:
     r = subprocess.run([str(c) for c in cmd], text=True, capture_output=True)
     if r.returncode != 0:
@@ -209,28 +197,88 @@ def sh(cmd: list, what: str) -> str:
     return r.stdout
 
 
-# ── тон ────────────────────────────────────────────────────────────────────────
-# Насколько похожи звуки двух роликов с общим хуком и советом при разном тоне
-# (замер Chromaprint, доля совпавших отрезков): один тон — 87%, разница 1% —
-# 67–76%, 3% — 12–29%, 6% (−3 и +3) — 1–5%. Поэтому ступени 3%, а не плавный
-# коридор: близкие тона звук не разводят.
-PITCH_SAME = {0: 1.0, 1: 0.25, 2: 0.03}     # «похожесть» по числу ступеней разницы
+# ── голос: тон × скорость ───────────────────────────────────────────────────
+# Звук двух роликов с общим голосом (хук + совет) разводят две вещи — высота и
+# темп. Замер Chromaprint, доля совпавших отрезков у такой пары:
+#   тон:      одинаковый 87–91%, разница 1% — 67–76%, 3% — 12–29%, 6% — 1–5%;
+#   скорость: одинаковая 91%, разница 3% — 35–38%, 4% — 28%, 6% — 20%, 10% — 12%.
+# Неслышных значений мало, поэтому и то и другое — ступенями (config.yaml), а
+# пара ступеней раздаётся так, чтобы ролики с общим голосом попадали в разные.
+_PITCH_CURVE = ((0.0, 1.0), (0.01, 0.8), (0.03, 0.25), (0.06, 0.03))
+_SPEED_CURVE = ((0.0, 1.0), (0.03, 0.4), (0.04, 0.3), (0.06, 0.22), (0.10, 0.13))
 
 
-def assign_pitch(weights: Weights, chosen: list[int], levels: list[float]) -> dict[int, float]:
-    """Тон каждому ролику: у самых похожих пар — как можно дальше друг от друга.
+def _curve(table: tuple, x: float) -> float:
+    x = abs(x)
+    for (x0, y0), (x1, y1) in zip(table, table[1:]):
+        if x <= x1:
+            return y0 + (y1 - y0) * (x - x0) / (x1 - x0)
+    return table[-1][1]
 
-    Жадно, от самых «нагруженных» роликов: тон, при котором сумма похожести с
-    уже раздавшими тон соседями минимальна.
+
+def voice_overlap(pa: float, sa: float, pb: float, sb: float) -> float:
+    """Какая доля общего голоса останется похожей при таких тонах и скоростях."""
+    return _curve(_PITCH_CURVE, pa - pb) * _curve(_SPEED_CURVE, sa - sb)
+
+
+# Какую долю звука ролика занимает каждый кусок имени h_t_c (хук ~¼, совет ~½,
+# финал ~¼) — общий кусок значит общий голос, даже если кадры уже разведены.
+BLOCK_AUDIO_SHARE = (25.0, 50.0, 25.0)
+
+
+def voice_weights(raw: Weights, stems: list[str]) -> Weights:
+    """Сколько звука делят ролики: общие куски по имени ∪ общие кадры (мемы)."""
+    out: Weights = [dict(w) for w in raw]
+    parts = [s.lower().split("_") if blocks_of(s) else None for s in stems]
+    for i in range(len(stems)):
+        for j in range(i + 1, len(stems)):
+            a, b = parts[i], parts[j]
+            if a is None or b is None or len(a) != len(b):
+                continue
+            share = sum(BLOCK_AUDIO_SHARE[k] if k < 3 else 0.0
+                        for k, (x, y) in enumerate(zip(a, b)) if x == y)
+            if share > out[i].get(j, 0.0):
+                out[i][j] = out[j][i] = share
+    return out
+
+
+ORIGINAL_WEIGHT = 100.0
+# Сочетания, при которых голос слишком похож на свой оригинал, не выдаются:
+# тон 3% без смены скорости — 0.25 (на тесте 31–32% совпавших отрезков).
+MAX_OWN_OVERLAP = 0.2
+
+
+def voice_options(pitches: list[float], speeds: list[float]) -> list[tuple[float, float]]:
+    opts = [(p, s) for p in pitches for s in speeds]
+    far = [o for o in opts if voice_overlap(o[0], o[1], 1.0, 1.0) <= MAX_OWN_OVERLAP]
+    return far or opts
+
+
+def voice_cost(o: tuple[float, float], u: int, weights: Weights,
+               picked: dict[int, tuple[float, float]]) -> float:
+    # Свой оригинал — тоже сосед, с которым ролик делит весь голос.
+    own = ORIGINAL_WEIGHT * voice_overlap(o[0], o[1], 1.0, 1.0)
+    return own + sum(w * voice_overlap(o[0], o[1], *picked[j])
+                     for j, w in weights[u].items() if j in picked)
+
+
+def assign_voice(weights: Weights, chosen: list[int], pitches: list[float],
+                 speeds: list[float]) -> dict[int, tuple[float, float]]:
+    """(тон, скорость) каждому ролику: у похожих по звуку — как можно дальше.
+
+    Жадно, от самых «нагруженных» роликов: пара ступеней, при которой сумма
+    оставшейся похожести с уже раздавшими соседями минимальна.
     """
+    options = voice_options(pitches, speeds)
     order = sorted(chosen, key=lambda i: -sum(weights[i].values()))
-    picked: dict[int, int] = {}
+    picked: dict[int, tuple[float, float]] = {}
+    used = {o: 0 for o in options}
     for u in order:
-        def cost(k: int) -> float:
-            return sum(w * PITCH_SAME.get(abs(k - picked[j]), 0.0)
-                       for j, w in weights[u].items() if j in picked)
-        picked[u] = min(range(len(levels)), key=lambda k: (cost(k), abs(levels[k] - 1.0) < 1e-9, k))
-    return {i: levels[k] for i, k in picked.items()}
+        best = min(options, key=lambda o: (round(voice_cost(o, u, weights, picked), 6),
+                                           used[o], options.index(o)))
+        picked[u] = best
+        used[best] += 1
+    return picked
 
 
 # ── рендер ────────────────────────────────────────────────────────────────────
@@ -418,24 +466,19 @@ def plan(srcs: list[Path], levers: set[str], count: int | None, allow_shared: bo
 
 
 def make_looks(raw: Weights, assign: dict[int, int], looks: list[tuple],
-               levers: set[str], cfg: dict) -> dict[int, Look]:
-    sp = cfg["speed"]
-    # Тон раздаётся по ПОЛНОМУ графу сходства, а не по графу «выше порога»:
+               levers: set[str], cfg: dict, stems: list[str]) -> dict[int, Look]:
+    # Голос раздаётся по ПОЛНОМУ графу сходства, а не по графу «выше порога»:
     # общий хук звучит одинаково и у пар, которые картинкой уже разведены.
-    pitches = (assign_pitch(raw, list(assign), cfg["pitch"]["levels"])
-               if "pitch" in levers else {})
-    rank: dict[int, int] = {}
+    pitches = cfg["pitch"]["levels"] if "pitch" in levers else [1.0]
+    speeds = cfg["speed"]["levels"] if "speed" in levers else [1.0]
+    voice = assign_voice(voice_weights(raw, stems), list(assign), pitches, speeds)
     out = {}
     for n, i in enumerate(sorted(assign)):
         c = assign[i]
         z, ox, oy, t = looks[c]
-        # Скорость считается по номеру ролика ВНУТРИ его облика: у роликов с одним
-        # обликом (а их рамка не разводит) скорости разные. Сдвиг 3·облик не даёт
-        # первым роликам всех обликов собраться в одно значение.
-        r = rank[c] = rank.get(c, -1) + 1
-        speed = speed_for(r + 3 * c, sp["min"], sp["max"], sp["dead_zone"]) if "speed" in levers else 1.0
+        pitch, speed = voice[i]
         out[i] = Look(look=c if "frame" in levers else -1, zoom=z, ox=ox, oy=oy, tilt=t,
-                      speed=speed, gop=15 + (n * 5) % 11, pitch=pitches.get(i, 1.0))
+                      speed=speed, gop=15 + (n * 5) % 11, pitch=pitch)
     return out
 
 
@@ -498,7 +541,7 @@ def cmd_run(args: argparse.Namespace, cfg: dict) -> int:
               f"скорость. Самые похожие:")
         for i, j, wt in shared[:5]:
             print(f"    {label(srcs[i], multi)} ↔ {label(srcs[j], multi)}: {wt:.0f}% общих кадров")
-    per = make_looks(raw, assign, looks, levers, cfg)
+    per = make_looks(raw, assign, looks, levers, cfg, [p.stem for p in srcs])
     if args.dry_run:
         for i in sorted(per):
             print(f"  {label(srcs[i], multi):<28} {per[i].describe()}")
@@ -550,18 +593,56 @@ REPAIR_ROUNDS = 3
 def gate_and_repair(out: Path, folders: list[Path], srcs: list[Path], per: dict[int, Look],
                     looks: list[tuple], threshold: float, levers: set[str], cfg: dict,
                     args: argparse.Namespace, multi: bool) -> int:
-    """Гейт новых роликов между собой; пары за порогом чинятся сменой облика.
+    """Гейты звука и картинки; пары за порогом чинятся, гейт повторяется.
 
-    Отбор разводит только пары, которые были за порогом УЖЕ в исходниках. Пара
-    чуть ниже порога с общим обликом может перешагнуть его после рендера: смена
-    скорости сдвигает секундную выборку (замер на 450 роликах: 7 пар, 29–44%).
-    Такой паре один ролик пересобирается с обликом, где у него меньше всего
-    общего с соседями, и гейт повторяется.
+    Сначала звук: его чинит смена тона и скорости, а скорость трогает и
+    картинку — поэтому картинка проверяется после. Смена облика картинки звук
+    уже не меняет.
+
+    Отбор разводит картинкой только пары, которые были за порогом УЖЕ в
+    исходниках. Пара чуть ниже порога с общим обликом может перешагнуть его
+    после рендера: смена скорости сдвигает секундную выборку (замер на 450
+    роликах: 7 пар, 29–44%). Такой паре один ролик пересобирается с обликом, где
+    у него меньше всего общего с соседями, и гейт повторяется.
     """
+    by_label = {label(p, multi): i for i, p in enumerate(srcs)}
+    target = lambda i: (out / srcs[i].parent.name if multi else out) / srcs[i].name  # noqa: E731
+    raw = None
+
+    def similar() -> Weights:
+        nonlocal raw
+        if raw is None:
+            print("Чиню пары за порогом: сравниваю исходники…", flush=True)
+            raw = similarity(srcs, args.jobs)
+        return raw
+
+    rc_audio = 0
+    if levers & {"pitch", "speed"}:
+        audio_report = out / "audio_report.json"
+        for rnd in range(REPAIR_ROUNDS + 1):
+            print("\n── звук" + (f" (повтор {rnd})" if rnd else "") + " ──", flush=True)
+            rc_audio = run_audio_gate(folders, args.against, audio_report)
+            limit = cfg["gate"]["audio_fail_pct"]
+            failed = [r for r in json.loads(audio_report.read_text()) if r["pct"] > limit]
+            if not failed or rnd == REPAIR_ROUNDS:
+                break
+            vw = voice_weights(similar(), [p.stem for p in srcs])
+            pitches = cfg["pitch"]["levels"] if "pitch" in levers else [1.0]
+            speeds = cfg["speed"]["levels"] if "speed" in levers else [1.0]
+            own = [by_label[_stem(r["a"], multi)] for r in failed if r["kind"] == "оригинал"]
+            pair_rows = [r for r in failed if r["kind"] != "оригинал"]
+            fix = list(dict.fromkeys(own + repair_targets(pair_rows, by_label, multi)))
+            pairs = [(_stem(r["a"], multi), _stem(r["b"], multi)) for r in pair_rows]
+            for i in fix:
+                me = label(srcs[i], multi)
+                partners = {by_label[b if a == me else a] for a, b in pairs if me in (a, b)}
+                per[i] = revoice(i, per, vw, partners, pitches, speeds)
+                render(srcs[i], target(i), per[i], cfg)
+                print(f"  пересобран {me}: {per[i].describe()}", flush=True)
+            save_plan(out, per, srcs, multi)
+
     report = out / "dedup_report.json"
     rc = 1
-    by_label = {label(p, multi): i for i, p in enumerate(srcs)}
-    weights = None
     for rnd in range(REPAIR_ROUNDS + 1):
         print("\n── новые ролики между собой" + (f" (повтор {rnd})" if rnd else "") + " ──", flush=True)
         rc = run_gate(folders, threshold, cfg, report)
@@ -569,29 +650,42 @@ def gate_and_repair(out: Path, folders: list[Path], srcs: list[Path], per: dict[
                   if max(p["pct_a"], p["pct_b"]) > threshold]
         if not failed or "frame" not in levers or rnd == REPAIR_ROUNDS:
             break
-        if weights is None:
-            print("Чиню пары за порогом: сравниваю исходники…", flush=True)
-            weights = similarity(srcs, args.jobs)
         fix = repair_targets(failed, by_label, multi)
         pairs = [(_stem(f["a"], multi), _stem(f["b"], multi)) for f in failed]
         for i in fix:
             me = label(srcs[i], multi)
             partners = {by_label[b if a == me else a] for a, b in pairs if me in (a, b)}
-            per[i] = relook(i, per, looks, weights, partners)
-            render(srcs[i], (out / srcs[i].parent.name if multi else out) / srcs[i].name,
-                   per[i], cfg)
-            print(f"  пересобран {label(srcs[i], multi)}: {per[i].describe()}", flush=True)
+            per[i] = relook(i, per, looks, similar(), partners)
+            render(srcs[i], target(i), per[i], cfg)
+            print(f"  пересобран {me}: {per[i].describe()}", flush=True)
         save_plan(out, per, srcs, multi)
     if args.against:
         print("\n── новые ролики против " + ", ".join(map(str, args.against)) + " ──", flush=True)
         rc |= run_gate(folders, threshold, cfg, out / "dedup_vs_against.json", args.against)
-    print("\n── звук ──", flush=True)
-    cmd = [sys.executable, str(ROOT / "qa_audio.py"), *map(str, folders),
-           "--report", str(out / "audio_report.json")]
-    for ref in args.against or []:
+    return rc | rc_audio
+
+
+def run_audio_gate(folders: list[Path], originals: list[Path] | None, report: Path) -> int:
+    cmd = [sys.executable, str(ROOT / "qa_audio.py"), *map(str, folders), "--report", str(report)]
+    for ref in originals or []:
         cmd += ["--originals", str(ref)]
-    rc |= subprocess.run(cmd).returncode
-    return rc
+    return subprocess.run(cmd).returncode
+
+
+def revoice(i: int, per: dict[int, Look], weights: Weights, partners: set[int],
+            pitches: list[float], speeds: list[float]) -> Look:
+    """Другие тон и скорость: меньше всего общего с соседями и оригиналом.
+
+    Сочетания пар, с которыми ролик только что не прошёл, исключаются.
+    """
+    picked = {j: (per[j].pitch, per[j].speed) for j in per if j != i}
+    banned = {picked[j] for j in partners if j in picked} | {(per[i].pitch, per[i].speed)}
+    options = [o for o in voice_options(pitches, speeds) if o not in banned] \
+        or voice_options(pitches, speeds)
+    pitch, speed = min(options, key=lambda o: voice_cost(o, i, weights, picked))
+    old = per[i]
+    return Look(look=old.look, zoom=old.zoom, ox=old.ox, oy=old.oy, tilt=old.tilt,
+                speed=speed, gop=old.gop, pitch=pitch)
 
 
 def _stem(report_label: str, multi: bool) -> str:
