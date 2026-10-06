@@ -54,7 +54,7 @@ def test_общий_кусок_делает_соседями():
 
 
 def test_рычаги_по_русски_и_наклон_тянет_рамку():
-    assert parse_levers("наклон,шум") == {"tilt", "frame", "noise"}
+    assert parse_levers("наклон,скорость") == {"tilt", "frame", "speed"}
 
 
 def _clique(n):
@@ -99,3 +99,15 @@ def test_починка_берёт_ролик_общий_для_нескольк
     failed = [{"a": "p/x.mp4", "b": "p/y.mp4"}, {"a": "p/y.mp4", "b": "p/z.mp4"}]
     idx = {"p/x": 0, "p/y": 1, "p/z": 2}
     assert repair_targets(failed, idx, multi=True) == [1]
+
+
+def test_тон_разводит_самую_похожую_пару_дальше_всего():
+    from uniquify import assign_pitch
+
+    w = [{1: 90.0, 2: 5.0}, {0: 90.0}, {0: 5.0}]
+    p = assign_pitch(w, [0, 1, 2], [0.97, 1.0, 1.03])
+    assert abs(p[0] - p[1]) >= 0.06 - 1e-9
+
+
+def test_рычаг_тон_по_русски():
+    assert parse_levers("рамка,тон") == {"frame", "pitch"}

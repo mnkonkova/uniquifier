@@ -17,16 +17,21 @@
               рамка   приближение 5–14% со сдвигом окна — главный рычаг;
               наклон  ±0.5° — расширяет набор обликов, титры чуть завалены;
               скорость ±1–3%, голос не меняет высоту — помогает, но не спасает;
-              шум     еле заметный слой из noise/pack — на хэш не влияет, косметика.
-            По умолчанию: рамка,скорость,шум.
+              тон     высота голоса −3% или +3% с сохранением тембра — главный
+                      рычаг для звука (против оригинала 36% → 12% совпавших
+                      отрезков Chromaprint), на слух не заметен.
+            По умолчанию: рамка,скорость,тон.
+
+            Шума нет намеренно: ни на картинке (100% совпавших кадров при шуме
+            25%), ни в звуке (91–100% совпавших отрезков даже при шуме на 6 дБ
+            тише голоса) он отпечатки не меняет.
 
 Облики (рамка ± наклон) подбираются под материал при каждом запуске: перебором
 по кадрам самих исходников (``palette.py``), результат кэшируется.
 
 Команды:
-  python uniquify.py pack                                  # шумы → noise/pack (один раз)
   python uniquify.py capacity SRC [SRC…]                   # сколько можно развести
-  python uniquify.py run SRC [SRC…] --name X --count 100 --threshold 10 --levers рамка,скорость,шум
+  python uniquify.py run SRC [SRC…] --name X --count 100 --threshold 10 --levers рамка,скорость,тон
   python uniquify.py run SRC --name X --dry-run            # только план
 """
 from __future__ import annotations
@@ -51,9 +56,9 @@ W, H, FPS = 1080, 1920, 30
 GOLDEN = 0.6180339887498949
 CACHE = ROOT / "output" / "_cache"
 
-LEVERS = {"рамка": "frame", "наклон": "tilt", "скорость": "speed", "шум": "noise",
-          "frame": "frame", "tilt": "tilt", "speed": "speed", "noise": "noise"}
-DEFAULT_LEVERS = "рамка,скорость,шум"
+LEVERS = {"рамка": "frame", "наклон": "tilt", "скорость": "speed", "тон": "pitch",
+          "frame": "frame", "tilt": "tilt", "speed": "speed", "pitch": "pitch"}
+DEFAULT_LEVERS = "рамка,скорость,тон"
 IDENTITY = (1.0, 0, 0, 0.0)
 
 
@@ -64,7 +69,7 @@ def parse_levers(text: str) -> set[str]:
         if not part:
             continue
         if part not in LEVERS:
-            raise SystemExit(f"Неизвестный рычаг «{part}». Есть: рамка, наклон, скорость, шум.")
+            raise SystemExit(f"Неизвестный рычаг «{part}». Есть: рамка, наклон, скорость, тон.")
         out.add(LEVERS[part])
     if "tilt" in out:
         out.add("frame")        # наклон крутит кадр внутри той же рамки
@@ -198,10 +203,6 @@ def speed_for(index: int, lo: float, hi: float, dead_zone: float) -> float:
     return round(v, 3)
 
 
-# ── шум ───────────────────────────────────────────────────────────────────────
-SLICE_SEC = 6.0
-
-
 def sh(cmd: list, what: str) -> str:
     r = subprocess.run([str(c) for c in cmd], text=True, capture_output=True)
     if r.returncode != 0:
@@ -209,94 +210,28 @@ def sh(cmd: list, what: str) -> str:
     return r.stdout
 
 
-def duration(path: Path) -> float:
-    out = sh(["ffprobe", "-v", "error", "-show_entries", "format=duration",
-              "-of", "default=nw=1:nk=1", path], f"ffprobe {path.name}")
-    try:
-        return float(out.strip())
-    except ValueError:
-        return 0.0
+# ── тон ────────────────────────────────────────────────────────────────────────
+# Насколько похожи звуки двух роликов с общим хуком и советом при разном тоне
+# (замер Chromaprint, доля совпавших отрезков): один тон — 87%, разница 1% —
+# 67–76%, 3% — 12–29%, 6% (−3 и +3) — 1–5%. Поэтому ступени 3%, а не плавный
+# коридор: близкие тона звук не разводят.
+PITCH_SAME = {0: 1.0, 1: 0.25, 2: 0.03}     # «похожесть» по числу ступеней разницы
 
 
-def video_size(path: Path) -> tuple[int, int]:
-    out = sh(["ffprobe", "-v", "error", "-select_streams", "v:0",
-              "-show_entries", "stream=width,height", "-of", "csv=p=0", path],
-             f"ffprobe {path.name}")
-    w, h = out.strip().split(",")[:2]
-    return int(w), int(h)
+def assign_pitch(weights: Weights, chosen: list[int], levels: list[float]) -> dict[int, float]:
+    """Тон каждому ролику: у самых похожих пар — как можно дальше друг от друга.
 
-
-def slice_plan(dur: float) -> int:
-    """Сколько нарезок брать из исходника: длинный даёт больше, но не больше 12."""
-    return max(3, min(12, int(dur // 5)))
-
-
-def noise_slice_filter(src_w: int, src_h: int, pos: float) -> str:
-    """Вертикальное окно из горизонтального шума → серый слой «вокруг 128».
-
-    Высокочастотная часть (кадр минус его размытие + 128) оставляет только
-    зерно/помехи и убирает общий свет исходника — поэтому любой шум одинаково
-    ложится поверх кадра режимом overlay и не красит его.
+    Жадно, от самых «нагруженных» роликов: тон, при котором сумма похожести с
+    уже раздавшими тон соседями минимальна.
     """
-    cw = min(src_w, round(src_h * W / H / 2) * 2)
-    x = round((src_w - cw) * pos)
-    return (f"crop={cw}:{src_h}:{x}:0,scale={W}:{H}:flags=bicubic,fps={FPS},"
-            f"format=gray,split[a][b];[b]gblur=sigma=12[bl];"
-            f"[a][bl]blend=all_mode=grainextract,format=gray")
-
-
-def noise_std(path: Path) -> float:
-    """Сила шума — СКО отклонения от 128 по нескольким кадрам."""
-    raw = subprocess.run(["ffmpeg", "-v", "error", "-i", str(path), "-vf",
-                          "fps=2,scale=270:480", "-f", "rawvideo", "-pix_fmt", "gray", "-"],
-                         capture_output=True).stdout
-    a = np.frombuffer(raw, np.uint8).astype(np.float32)
-    return float(np.sqrt(np.mean((a - 128.0) ** 2))) if a.size else 0.0
-
-
-def cmd_pack(args: argparse.Namespace, cfg: dict) -> int:
-    src_dir = ROOT / "noise" / "sources"
-    pack = ROOT / cfg["noise"]["pack"]
-    sources = sorted(p for p in src_dir.iterdir() if p.suffix.lower() in {".mp4", ".webm", ".mov", ".ogv"})
-    if not sources:
-        print(f"В {src_dir} нет исходников — запустите noise/fetch_sources.sh")
-        return 1
-    if pack.exists():
-        shutil.rmtree(pack)
-    pack.mkdir(parents=True)
-    jobs = []
-    for src in sources:
-        dur = duration(src)
-        sw, sh_ = video_size(src)
-        k = slice_plan(dur)
-        for j in range(k):
-            start = 0.0 if dur <= SLICE_SEC else (dur - SLICE_SEC) * j / max(1, k - 1)
-            pos = (j * GOLDEN + 0.5) % 1.0
-            jobs.append((src, start, sw, sh_, pos, j))
-    index = []
-
-    def make(job, n):
-        src, start, sw, sh_, pos, j = job
-        out = pack / f"noise_{n:03d}.mp4"
-        sh(["ffmpeg", "-y", "-v", "error", "-stream_loop", "-1", "-ss", f"{start:.2f}",
-            "-i", src, "-t", SLICE_SEC, "-an",
-            "-filter_complex", noise_slice_filter(sw, sh_, pos),
-            "-c:v", "libx264", "-preset", "medium", "-crf", 16, "-pix_fmt", "yuv420p",
-            "-g", FPS, out], f"нарезка {src.name}")
-        return {"file": out.name, "source": src.name, "start": round(start, 2),
-                "window": round(pos, 3), "std": round(noise_std(out), 2)}
-
-    with ThreadPoolExecutor(args.jobs) as ex:
-        index = list(ex.map(make, jobs, range(len(jobs))))
-    weak = [e for e in index if e["std"] < 1.0]
-    index = [e for e in index if e["std"] >= 1.0]
-    for e in weak:
-        (pack / e["file"]).unlink(missing_ok=True)
-    (pack / "_index.json").write_text(json.dumps(index, ensure_ascii=False, indent=1))
-    print(f"Нарезок шума: {len(index)} из {len(sources)} исходников → {pack}")
-    if weak:
-        print(f"Выброшено почти пустых нарезок: {len(weak)}")
-    return 0
+    order = sorted(chosen, key=lambda i: -sum(weights[i].values()))
+    picked: dict[int, int] = {}
+    for u in order:
+        def cost(k: int) -> float:
+            return sum(w * PITCH_SAME.get(abs(k - picked[j]), 0.0)
+                       for j, w in weights[u].items() if j in picked)
+        picked[u] = min(range(len(levels)), key=lambda k: (cost(k), abs(levels[k] - 1.0) < 1e-9, k))
+    return {i: levels[k] for i, k in picked.items()}
 
 
 # ── рендер ────────────────────────────────────────────────────────────────────
@@ -309,9 +244,8 @@ class Look:
     y: int
     tilt: float
     speed: float
-    noise: str | None
-    noise_opacity: float
     gop: int
+    pitch: float = 1.0
 
     def describe(self) -> str:
         parts = []
@@ -320,13 +254,22 @@ class Look:
             parts.append(f"облик #{self.look:02d} (×{self.zoom:.2f} @ {self.x},{self.y}{tilt})")
         if self.speed != 1.0:
             parts.append(f"скорость {self.speed:.3f}")
-        if self.noise:
-            parts.append(f"шум {self.noise} ×{self.noise_opacity:.2f}")
+        if self.pitch != 1.0:
+            parts.append(f"тон {100 * (self.pitch - 1):+.0f}%")
         return ", ".join(parts) or "без изменений"
 
 
-def build_filter(look: Look) -> tuple[str, bool]:
-    """filter_complex и нужен ли второй вход (шум)."""
+def audio_filter(look: Look) -> str:
+    chain = [f"atempo={look.speed}"]
+    if look.pitch != 1.0:
+        # formant=preserved: двигается высота, а тембр остаётся — голос не
+        # становится «мультяшным», как при простом ускорении пластинки.
+        chain.append(f"rubberband=pitch={look.pitch}:formant=preserved:pitchq=quality")
+    chain.append("aresample=48000")
+    return ",".join(chain)
+
+
+def build_filter(look: Look) -> str:
     w, h = palette.scaled_size(look.zoom)
     chain = [f"[0:v]setpts=PTS/{look.speed}", f"fps={FPS}"]
     if look.look >= 0:
@@ -335,28 +278,12 @@ def build_filter(look: Look) -> tuple[str, bool]:
             chain.append(f"rotate={look.tilt}*PI/180:ow=iw:oh=ih:c=black:bilinear=1")
         chain.append(f"crop={W}:{H}:{look.x}:{look.y}")
     chain += ["setsar=1", "format=yuv420p"]
-    video = ",".join(chain)
-    if look.noise:
-        video += ("[m];[1:v]scale={W}:{H},format=yuv420p[n];"
-                  # Шум только по яркости. В режиме normal ffmpeg считает
-                  # A·op + B·(1−op), поэтому цвет кадра сохраняет opacity 1, а не 0
-                  # (0 отдаёт серый цвет слоя шума — ролик становится чёрно-белым).
-                  f"[m][n]blend=c0_mode=overlay:c0_opacity={look.noise_opacity:.3f}:"
-                  "c1_mode=normal:c1_opacity=1:c2_mode=normal:c2_opacity=1:shortest=1[v]"
-                  ).replace("{W}", str(W)).replace("{H}", str(H))
-    else:
-        video += "[v]"
-    audio = f"[0:a]atempo={look.speed},aresample=48000[a]"
-    return f"{video};{audio}", bool(look.noise)
+    return ",".join(chain) + "[v];" + f"[0:a]{audio_filter(look)}[a]"
 
 
-def render(src: Path, out: Path, look: Look, noise_dir: Path, cfg: dict) -> None:
-    fc, with_noise = build_filter(look)
-    inputs = ["-i", src]
-    if with_noise:
-        inputs += ["-stream_loop", "-1", "-i", noise_dir / look.noise]
-    sh(["ffmpeg", "-y", "-v", "error", *inputs,
-        "-filter_complex", fc, "-map", "[v]", "-map", "[a]",
+def render(src: Path, out: Path, look: Look, cfg: dict) -> None:
+    sh(["ffmpeg", "-y", "-v", "error", "-i", src,
+        "-filter_complex", build_filter(look), "-map", "[v]", "-map", "[a]",
         "-c:v", "libx264", "-preset", cfg["render"]["preset"], "-crf", cfg["render"]["crf"],
         "-r", FPS, "-g", look.gop, "-pix_fmt", "yuv420p",
         "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709",
@@ -409,20 +336,23 @@ def find_looks(srcs: list[Path], levers: set[str], cfg: dict, jobs: int) -> list
 def plan(srcs: list[Path], levers: set[str], count: int | None, allow_shared: bool,
          threshold: float, cfg: dict, jobs: int):
     print(f"Сравниваю исходники между собой ({len(srcs)} роликов)…", flush=True)
-    weights = over(similarity(srcs, jobs), threshold)
+    raw = similarity(srcs, jobs)
+    weights = over(raw, threshold)
     looks = find_looks(srcs, levers, cfg, jobs)
     strict = select_strict(weights, len(looks), count)
     assign = strict
     if allow_shared and count and len(strict) < count:
         assign = fill_shared(weights, len(looks), strict, min(count, len(srcs)))
-    return weights, looks, strict, assign
+    return raw, weights, looks, strict, assign
 
 
-def make_looks(srcs: list[Path], assign: dict[int, int], looks: list[tuple],
+def make_looks(raw: Weights, assign: dict[int, int], looks: list[tuple],
                levers: set[str], cfg: dict) -> dict[int, Look]:
-    index = (json.loads((ROOT / cfg["noise"]["pack"] / "_index.json").read_text())
-             if "noise" in levers else [])
     sp = cfg["speed"]
+    # Тон раздаётся по ПОЛНОМУ графу сходства, а не по графу «выше порога»:
+    # общий хук звучит одинаково и у пар, которые картинкой уже разведены.
+    pitches = (assign_pitch(raw, list(assign), cfg["pitch"]["levels"])
+               if "pitch" in levers else {})
     rank: dict[int, int] = {}
     out = {}
     for n, i in enumerate(sorted(assign)):
@@ -433,13 +363,8 @@ def make_looks(srcs: list[Path], assign: dict[int, int], looks: list[tuple],
         # первым роликам всех обликов собраться в одно значение.
         r = rank[c] = rank.get(c, -1) + 1
         speed = speed_for(r + 3 * c, sp["min"], sp["max"], sp["dead_zone"]) if "speed" in levers else 1.0
-        noise, opacity = None, 0.0
-        if index:
-            nz = index[(n * 7) % len(index)]
-            noise = nz["file"]
-            opacity = round(min(0.6, cfg["noise"]["strength"] / max(nz["std"], 1e-3)), 3)
         out[i] = Look(look=c if "frame" in levers else -1, zoom=z, x=x, y=y, tilt=t,
-                      speed=speed, noise=noise, noise_opacity=opacity, gop=15 + (n * 5) % 11)
+                      speed=speed, gop=15 + (n * 5) % 11, pitch=pitches.get(i, 1.0))
     return out
 
 
@@ -462,9 +387,9 @@ def cmd_capacity(args: argparse.Namespace, cfg: dict) -> int:
     print("Сходство исходников (доля общих кадров у пары):")
     for t in (0, 10, 30, 80):
         print(f"  больше {t:>2}%: {(pcts > t).sum():>6} пар")
-    sets = [("скорость+шум", {"speed", "noise"}),
-            ("рамка+скорость+шум", {"frame", "speed", "noise"}),
-            ("+наклон", {"frame", "tilt", "speed", "noise"})]
+    sets = [("скорость", {"speed"}),
+            ("рамка+скорость", {"frame", "speed"}),
+            ("+наклон", {"frame", "tilt", "speed"})]
     sizes = {name: len(find_looks(srcs, lv, cfg, args.jobs)) for name, lv in sets}
     thresholds = args.thresholds
     print("\nСколько роликов можно сделать уникальными при пороге гейта:")
@@ -480,17 +405,13 @@ def cmd_capacity(args: argparse.Namespace, cfg: dict) -> int:
 
 def cmd_run(args: argparse.Namespace, cfg: dict) -> int:
     levers = parse_levers(args.levers)
-    noise_dir = ROOT / cfg["noise"]["pack"]
-    if "noise" in levers and not (noise_dir / "_index.json").exists():
-        print("Нет нарезок шума — сначала: python uniquify.py pack")
-        return 1
     srcs = collect(args.src, args.limit)
     if not srcs:
         print(f"В {', '.join(map(str, args.src))} нет роликов")
         return 1
     multi = len(args.src) > 1
     threshold = cfg["gate"]["fail_pct"] if args.threshold is None else args.threshold
-    weights, looks, strict, assign = plan(srcs, levers, args.count, args.allow_shared,
+    raw, weights, looks, strict, assign = plan(srcs, levers, args.count, args.allow_shared,
                                           threshold, cfg, args.jobs)
     want = min(args.count or len(srcs), len(srcs))
     print(f"\nРычаги: {', '.join(sorted(levers))} · обликов: {len(looks)}")
@@ -506,7 +427,7 @@ def cmd_run(args: argparse.Namespace, cfg: dict) -> int:
               f"скорость. Самые похожие:")
         for i, j, wt in shared[:5]:
             print(f"    {label(srcs[i], multi)} ↔ {label(srcs[j], multi)}: {wt:.0f}% общих кадров")
-    per = make_looks(srcs, assign, looks, levers, cfg)
+    per = make_looks(raw, assign, looks, levers, cfg)
     if args.dry_run:
         for i in sorted(per):
             print(f"  {label(srcs[i], multi):<28} {per[i].describe()}")
@@ -530,7 +451,7 @@ def cmd_run(args: argparse.Namespace, cfg: dict) -> int:
 
     def one(i: int):
         nonlocal done
-        render(srcs[i], target(srcs[i]), per[i], noise_dir, cfg)
+        render(srcs[i], target(srcs[i]), per[i], cfg)
         done += 1
         print(f"  [{done}/{len(per)}] {label(srcs[i], multi)}: {per[i].describe()}", flush=True)
 
@@ -587,12 +508,18 @@ def gate_and_repair(out: Path, folders: list[Path], srcs: list[Path], per: dict[
             partners = {by_label[b if a == me else a] for a, b in pairs if me in (a, b)}
             per[i] = relook(i, per, looks, weights, partners)
             render(srcs[i], (out / srcs[i].parent.name if multi else out) / srcs[i].name,
-                   per[i], ROOT / cfg["noise"]["pack"], cfg)
+                   per[i], cfg)
             print(f"  пересобран {label(srcs[i], multi)}: {per[i].describe()}", flush=True)
         save_plan(out, per, srcs, multi)
     if args.against:
         print("\n── новые ролики против " + ", ".join(map(str, args.against)) + " ──", flush=True)
         rc |= run_gate(folders, threshold, cfg, out / "dedup_vs_against.json", args.against)
+    print("\n── звук ──", flush=True)
+    cmd = [sys.executable, str(ROOT / "qa_audio.py"), *map(str, folders),
+           "--report", str(out / "audio_report.json")]
+    for ref in args.against or []:
+        cmd += ["--originals", str(ref)]
+    rc |= subprocess.run(cmd).returncode
     return rc
 
 
@@ -633,8 +560,8 @@ def relook(i: int, per: dict[int, Look], looks: list[tuple], weights: Weights,
     options = [c for c in range(len(looks)) if c not in banned] or list(range(len(looks)))
     c = min(options, key=lambda k: (cost[k], k))
     z, x, y, t = looks[c]
-    return Look(look=c, zoom=z, x=x, y=y, tilt=t, speed=per[i].speed, noise=per[i].noise,
-                noise_opacity=per[i].noise_opacity, gop=per[i].gop)
+    return Look(look=c, zoom=z, x=x, y=y, tilt=t, speed=per[i].speed, gop=per[i].gop,
+                pitch=per[i].pitch)
 
 
 def save_plan(out: Path, per: dict[int, Look], srcs: list[Path], multi: bool) -> None:
@@ -665,9 +592,6 @@ def main() -> int:
     ap.add_argument("--config", type=Path, default=ROOT / "config.yaml")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    p = sub.add_parser("pack", help="нарезать шумы из noise/sources в noise/pack")
-    p.add_argument("--jobs", type=int, default=4)
-
     c = sub.add_parser("capacity", help="сколько роликов можно сделать уникальными")
     c.add_argument("src", type=Path, nargs="+")
     c.add_argument("--limit", type=int)
@@ -680,7 +604,7 @@ def main() -> int:
     r.add_argument("--name", required=True, help="папка в output/ (версии v1, v2…)")
     r.add_argument("--count", type=int, help="сколько роликов выдать (по умолчанию — сколько выйдет)")
     r.add_argument("--levers", default=DEFAULT_LEVERS,
-                   help="рамка,наклон,скорость,шум — через запятую (по умолчанию %(default)s)")
+                   help="рамка,наклон,скорость,тон — через запятую (по умолчанию %(default)s)")
     r.add_argument("--threshold", type=float,
                    help="пара не проходит гейт при > N%% общих кадров (по умолчанию gate.fail_pct из config.yaml)")
     r.add_argument("--allow-shared", action="store_true",
@@ -702,8 +626,6 @@ def main() -> int:
     cfg = yaml.safe_load(args.config.read_text())
     if args.cmd == "repair":
         return cmd_repair(args, cfg)
-    if args.cmd == "pack":
-        return cmd_pack(args, cfg)
     if args.cmd == "capacity":
         return cmd_capacity(args, cfg)
     return cmd_run(args, cfg)
