@@ -537,18 +537,126 @@ def cmd_run(args: argparse.Namespace, cfg: dict) -> int:
     with ThreadPoolExecutor(cfg["render"]["jobs"]) as ex:
         list(ex.map(one, sorted(per)))
 
-    base = [sys.executable, str(ROOT / "qa_dedup.py"), *map(str, folders),
-            "--distance", str(cfg["gate"]["distance"]),
-            "--fail-pct", str(threshold)]
-    print("\n── новые ролики между собой ──", flush=True)
-    rc = subprocess.run(base + ["--report", str(out / "dedup_report.json")]).returncode
-    if args.against:
-        print("\n── новые ролики против " + ", ".join(map(str, args.against)) + " ──", flush=True)
-        against = [a for ref in args.against for a in ("--against", str(ref))]
-        rc |= subprocess.run(base + against
-                             + ["--report", str(out / "dedup_vs_against.json")]).returncode
+    rc = gate_and_repair(out, folders, srcs, per, looks, threshold, levers, cfg, args, multi)
     print(f"\nГотово: {out}")
     return rc
+
+
+def run_gate(folders: list[Path], threshold: float, cfg: dict, report: Path,
+             against: list[Path] | None = None) -> int:
+    cmd = [sys.executable, str(ROOT / "qa_dedup.py"), *map(str, folders),
+           "--distance", str(cfg["gate"]["distance"]), "--fail-pct", str(threshold),
+           "--report", str(report)]
+    for ref in against or []:
+        cmd += ["--against", str(ref)]
+    return subprocess.run(cmd).returncode
+
+
+REPAIR_ROUNDS = 3
+
+
+def gate_and_repair(out: Path, folders: list[Path], srcs: list[Path], per: dict[int, Look],
+                    looks: list[tuple], threshold: float, levers: set[str], cfg: dict,
+                    args: argparse.Namespace, multi: bool) -> int:
+    """Гейт новых роликов между собой; пары за порогом чинятся сменой облика.
+
+    Отбор разводит только пары, которые были за порогом УЖЕ в исходниках. Пара
+    чуть ниже порога с общим обликом может перешагнуть его после рендера: смена
+    скорости сдвигает секундную выборку (замер на 450 роликах: 7 пар, 29–44%).
+    Такой паре один ролик пересобирается с обликом, где у него меньше всего
+    общего с соседями, и гейт повторяется.
+    """
+    report = out / "dedup_report.json"
+    rc = 1
+    by_label = {label(p, multi): i for i, p in enumerate(srcs)}
+    weights = None
+    for rnd in range(REPAIR_ROUNDS + 1):
+        print("\n── новые ролики между собой" + (f" (повтор {rnd})" if rnd else "") + " ──", flush=True)
+        rc = run_gate(folders, threshold, cfg, report)
+        failed = [p for p in json.loads(report.read_text())
+                  if max(p["pct_a"], p["pct_b"]) > threshold]
+        if not failed or "frame" not in levers or rnd == REPAIR_ROUNDS:
+            break
+        if weights is None:
+            print("Чиню пары за порогом: сравниваю исходники…", flush=True)
+            weights = similarity(srcs, args.jobs)
+        fix = repair_targets(failed, by_label, multi)
+        pairs = [(_stem(f["a"], multi), _stem(f["b"], multi)) for f in failed]
+        for i in fix:
+            me = label(srcs[i], multi)
+            partners = {by_label[b if a == me else a] for a, b in pairs if me in (a, b)}
+            per[i] = relook(i, per, looks, weights, partners)
+            render(srcs[i], (out / srcs[i].parent.name if multi else out) / srcs[i].name,
+                   per[i], ROOT / cfg["noise"]["pack"], cfg)
+            print(f"  пересобран {label(srcs[i], multi)}: {per[i].describe()}", flush=True)
+        save_plan(out, per, srcs, multi)
+    if args.against:
+        print("\n── новые ролики против " + ", ".join(map(str, args.against)) + " ──", flush=True)
+        rc |= run_gate(folders, threshold, cfg, out / "dedup_vs_against.json", args.against)
+    return rc
+
+
+def _stem(report_label: str, multi: bool) -> str:
+    """«папка/имя.mp4» из отчёта гейта → метка ролика, как в плане."""
+    folder, name = report_label.rsplit("/", 1)
+    stem = name.rsplit(".", 1)[0]
+    return f"{folder}/{stem}" if multi else stem
+
+
+def repair_targets(failed: list[dict], by_label: dict[str, int], multi: bool) -> list[int]:
+    """Кого пересобирать: по одному ролику из каждой пары, по возможности общему
+    для нескольких пар (так одной пересборкой чинится сразу несколько)."""
+    count: dict[str, int] = {}
+    for f in failed:
+        for side in (f["a"], f["b"]):
+            count[_stem(side, multi)] = count.get(_stem(side, multi), 0) + 1
+    chosen: list[str] = []
+    for f in failed:
+        a, b = _stem(f["a"], multi), _stem(f["b"], multi)
+        if a in chosen or b in chosen:
+            continue
+        chosen.append(a if count[a] >= count[b] else b)
+    return [by_label[c] for c in chosen]
+
+
+def relook(i: int, per: dict[int, Look], looks: list[tuple], weights: Weights,
+           partners: set[int]) -> Look:
+    """Облик, где у ролика меньше всего общих кадров с соседями этого облика.
+
+    Облики пар, с которыми ролик только что не прошёл гейт, исключаются.
+    """
+    cost = [0.0] * len(looks)
+    for j, pct in weights[i].items():
+        if j in per and per[j].look >= 0:
+            cost[per[j].look] += pct
+    banned = {per[j].look for j in partners if j in per} | {per[i].look}
+    options = [c for c in range(len(looks)) if c not in banned] or list(range(len(looks)))
+    c = min(options, key=lambda k: (cost[k], k))
+    z, x, y, t = looks[c]
+    return Look(look=c, zoom=z, x=x, y=y, tilt=t, speed=per[i].speed, noise=per[i].noise,
+                noise_opacity=per[i].noise_opacity, gop=per[i].gop)
+
+
+def save_plan(out: Path, per: dict[int, Look], srcs: list[Path], multi: bool) -> None:
+    plan_file = out / "plan.json"
+    data = json.loads(plan_file.read_text())
+    data["videos"] = {label(srcs[i], multi): asdict(l) for i, l in sorted(per.items())}
+    plan_file.write_text(json.dumps(data, ensure_ascii=False, indent=1))
+
+
+def cmd_repair(args: argparse.Namespace, cfg: dict) -> int:
+    """Починить уже собранную версию: гейт + пересборка роликов за порогом."""
+    out = args.version.resolve()
+    data = json.loads((out / "plan.json").read_text())
+    srcs = collect(args.src, None)
+    multi = len(args.src) > 1
+    by_label = {label(p, multi): i for i, p in enumerate(srcs)}
+    per = {by_label[k]: Look(**v) for k, v in data["videos"].items() if k in by_label}
+    looks = [tuple(x) for x in data["looks"]]
+    levers = set(data["levers"])
+    threshold = data.get("threshold", cfg["gate"]["fail_pct"]) if args.threshold is None else args.threshold
+    folders = [out / f.name for f in args.src] if multi else [out]
+    return gate_and_repair(out, folders, srcs, per, looks, threshold, levers, cfg, args, multi)
 
 
 def main() -> int:
@@ -583,8 +691,17 @@ def main() -> int:
     r.add_argument("--jobs", type=int, default=10, help="процессов для хэширования")
     r.add_argument("--dry-run", action="store_true", help="только показать план")
 
+    f = sub.add_parser("repair", help="починить собранную версию: пары за порогом пересобрать")
+    f.add_argument("version", type=Path, help="папка версии, например output/bot_уник/v1")
+    f.add_argument("src", type=Path, nargs="+", help="те же папки исходников, что при сборке")
+    f.add_argument("--threshold", type=float)
+    f.add_argument("--against", type=Path, action="append")
+    f.add_argument("--jobs", type=int, default=10)
+
     args = ap.parse_args()
     cfg = yaml.safe_load(args.config.read_text())
+    if args.cmd == "repair":
+        return cmd_repair(args, cfg)
     if args.cmd == "pack":
         return cmd_pack(args, cfg)
     if args.cmd == "capacity":

@@ -91,3 +91,11 @@ def test_расстояние_хэмминга():
     a = np.array([[0, 1, 1, 0]], dtype=np.uint8)
     b = np.array([[1, 1, 0, 0], [0, 1, 1, 0]], dtype=np.uint8)
     assert distances(a, b).tolist() == [[2, 0]]
+
+
+def test_починка_берёт_ролик_общий_для_нескольких_пар():
+    from uniquify import repair_targets
+
+    failed = [{"a": "p/x.mp4", "b": "p/y.mp4"}, {"a": "p/y.mp4", "b": "p/z.mp4"}]
+    idx = {"p/x": 0, "p/y": 1, "p/z": 2}
+    assert repair_targets(failed, idx, multi=True) == [1]
