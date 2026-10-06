@@ -153,10 +153,16 @@ def videos_in(folder: Path) -> list[Path]:
                   if p.suffix.lower() in {".mp4", ".mov"} and not p.name.startswith("."))
 
 
+def label(path: Path) -> str:
+    """Имя ролика вместе с папкой — в нескольких партиях имена могут совпадать."""
+    return f"{path.parent.name}/{path.name}"
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("folder", type=Path, help="папка с готовыми роликами")
+    ap.add_argument("folder", type=Path, nargs="+",
+                    help="папки с готовыми роликами (ролики всех папок сравниваются между собой)")
     ap.add_argument("--against", type=Path, action="append",
                     help="сравнивать с роликами из этой папки (можно несколько раз)")
     ap.add_argument("--fail-pct", type=float, default=0.0,
@@ -169,9 +175,9 @@ def main() -> int:
     ap.add_argument("--show", type=int, default=20, help="сколько худших пар показать")
     args = ap.parse_args()
 
-    paths = videos_in(args.folder)
+    paths = [p for f in args.folder for p in videos_in(f)]
     if not paths:
-        print(f"В {args.folder} нет роликов")
+        print(f"В {', '.join(map(str, args.folder))} нет роликов")
         return 1
     print(f"Хэширую {len(paths)} роликов (кадр в секунду, PDQ)…", flush=True)
     videos = load_many(paths, args.jobs)
@@ -197,12 +203,12 @@ def main() -> int:
         print(f"Ближайшие кадры: минимум {mins.min()} бит, медиана {np.median(mins):.0f} бит")
     for p in pairs[:args.show]:
         mark = "FAIL" if p.worst > args.fail_pct else " ok "
-        print(f"  {mark} {p.a.name:<22} ↔ {p.b.name:<22} "
+        print(f"  {mark} {label(p.a):<34} ↔ {label(p.b):<34} "
               f"{p.pct_a:5.1f}% / {p.pct_b:5.1f}%  мин {p.min_bits:3d} бит")
 
     if args.report:
         args.report.write_text(json.dumps([
-            {"a": p.a.name, "b": p.b.name, "pct_a": round(p.pct_a, 1),
+            {"a": label(p.a), "b": label(p.b), "pct_a": round(p.pct_a, 1),
              "pct_b": round(p.pct_b, 1), "min_bits": p.min_bits,
              "median_bits": p.median_bits} for p in pairs], ensure_ascii=False, indent=1))
         print(f"\nОтчёт: {args.report}")

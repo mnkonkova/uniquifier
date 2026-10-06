@@ -9,26 +9,37 @@ sys.path.insert(0, str(ROOT))
 
 import numpy as np  # noqa: E402
 
+import palette  # noqa: E402
 from qa_dedup import distances  # noqa: E402
 from uniquify import (  # noqa: E402
-    FRAMINGS,
-    assign_framings,
     blocks_of,
     conflicts,
-    framing_is_safe,
-    shared_framing_pairs,
+    fill_shared,
+    parse_levers,
+    select_strict,
+    shared_pairs,
     speed_for,
 )
 
-
-def test_рамки_не_режут_титры_бот_работ():
-    """Все рамки набора безопасны для титров 95–994 px с полем 8 px."""
-    unsafe = [f for f in FRAMINGS if not framing_is_safe(f, 95, 994, 8)]
-    assert not unsafe, f"рамки срезают титры: {unsafe}"
+LIM = palette.Limits()
 
 
-def test_рамки_не_повторяются():
-    assert len(set(FRAMINGS)) == len(FRAMINGS)
+def test_кандидаты_не_режут_титры_и_не_открывают_углы():
+    for look in palette.candidates(tilt=True, lim=LIM):
+        assert palette.no_black_corners(look), look
+        l, tp, r, b = LIM.text_box
+        for px in (l, r):
+            for py in (tp, b):
+                u, _ = palette.to_out(px, py, look)
+                assert LIM.text_margin <= u <= 1080 - LIM.text_margin, (look, px, py, u)
+
+
+def test_наклон_даёт_больше_кандидатов():
+    assert len(palette.candidates(True, LIM)) > len(palette.candidates(False, LIM))
+
+
+def test_без_рамки_оригинал_на_месте():
+    assert palette.to_out(100, 200, (1.0, 0, 0, 0.0)) == (100, 200)
 
 
 def test_имя_разбирается_на_куски():
@@ -42,27 +53,31 @@ def test_общий_кусок_делает_соседями():
     assert adj[2] == set()
 
 
-def _grid_weights():
-    """Сетка h×t×c, как у «бот работ»: 200 роликов, у пары с общим куском вес 1."""
-    stems = [f"h{h}_t{t}_c{c}" for h in range(1, 11) for t in range(1, 11)
-             for c in ((h + t - 2) % 10 + 1, (h + t + 3) % 10 + 1)]
-    adj = conflicts(stems)
-    return [{j: 1.0 for j in a} for a in adj]
+def test_рычаги_по_русски_и_наклон_тянет_рамку():
+    assert parse_levers("наклон,шум") == {"tilt", "frame", "noise"}
 
 
-def test_раскраска_сетки_без_общих_рамок():
-    """На сетке по именам 33 рамок хватает с запасом — ни одной общей пары."""
-    w = _grid_weights()
-    colors = assign_framings(w, len(FRAMINGS))
-    assert not shared_framing_pairs(w, colors)
+def _clique(n):
+    return [{j: 1.0 for j in range(n) if j != i} for i in range(n)]
 
 
-def test_нехватка_рамок_отдаёт_общую_самой_слабой_паре():
-    # Треугольник, две рамки: общую рамку должна получить пара с весом 1, а не 10.
+def test_строгий_отбор_не_даёт_похожим_один_облик():
+    w = _clique(5)
+    chosen = select_strict(w, 3, None)
+    assert len(chosen) == 3 and not shared_pairs(w, chosen)
+
+
+def test_отбор_останавливается_на_count():
+    w = [dict() for _ in range(10)]
+    assert len(select_strict(w, 1, 4)) == 4
+
+
+def test_добор_отдаёт_общий_облик_самой_слабой_паре():
+    # Треугольник, два облика: общий должна получить пара с весом 1, а не 10.
     w = [{1: 10.0, 2: 10.0}, {0: 10.0, 2: 1.0}, {0: 10.0, 1: 1.0}]
-    colors = assign_framings(w, 2)
-    shared = shared_framing_pairs(w, colors)
-    assert [(i, j) for i, j, _ in shared] == [(1, 2)]
+    chosen = select_strict(w, 2, None)
+    full = fill_shared(w, 2, chosen, 3)
+    assert [(i, j) for i, j, _ in shared_pairs(w, full)] == [(1, 2)]
 
 
 def test_скорость_в_коридоре_и_мимо_мёртвой_зоны():
