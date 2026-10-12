@@ -340,14 +340,26 @@ def probe(src: Path) -> Media:
     return Media(w, h, fps, any(st.get("codec_type") == "audio" for st in streams))
 
 
+def out_fps(src_fps: str, speed: float) -> str:
+    """Частота кадров выхода = исходная × скорость (дробью, без округления)."""
+    from fractions import Fraction
+
+    f = Fraction(src_fps) * Fraction(str(speed))
+    return f"{f.numerator}/{f.denominator}"
+
+
 def audio_filter(look: Look) -> str:
-    chain = [f"atempo={look.speed}"]
-    if look.pitch != 1.0:
-        # formant=preserved: двигается высота, а тембр остаётся — голос не
-        # становится «мультяшным», как при простом ускорении пластинки.
-        chain.append(f"rubberband=pitch={look.pitch}:formant=preserved:pitchq=quality")
-    chain.append("aresample=48000")
-    return ",".join(chain)
+    """Темп и тон ОДНИМ проходом rubberband.
+
+    Раньше темп менял atempo, а тон — rubberband отдельно: два растяжения
+    подряд, и на крайних значениях (тон ±6%, скорость ±8%) голос давал
+    металлическое «робо-эхо» (отзыв 2026-10-12). formant=preserved — двигается
+    высота, тембр остаётся.
+    """
+    if look.pitch == 1.0 and look.speed == 1.0:
+        return "aresample=48000"
+    return (f"rubberband=tempo={look.speed}:pitch={look.pitch}:formant=preserved:"
+            f"pitchq=quality,aresample=48000")
 
 
 def build_filter(look: Look, media: Media) -> str:
@@ -358,7 +370,10 @@ def build_filter(look: Look, media: Media) -> str:
     требует yuv420p).
     """
     w0, h0 = palette.even(media.width), palette.even(media.height)
-    chain = [f"[0:v]setpts=PTS/{look.speed}", f"fps={media.fps}"]
+    # Кадры не выбрасываются и не дублируются: частота кадров меняется вместе
+    # со скоростью (30 → 31.2 при ×1.04). С жёсткими 30 к/с ×0.92 давал повтор
+    # каждого 12-го кадра — это читалось как подёргивание.
+    chain = [f"[0:v]setpts=PTS/{look.speed}"]
     if look.look >= 0:
         w, h = palette.even(w0 * look.zoom), palette.even(h0 * look.zoom)
         chain.append(f"scale={w}:{h}:flags=bicubic")
@@ -383,7 +398,7 @@ def render_cmd(src: Path, out: Path, look: Look, media: Media, cfg: dict) -> lis
     if media.has_audio:
         cmd += ["-map", "[a]", "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2"]
     cmd += ["-c:v", "libx264", "-preset", cfg["render"]["preset"], "-crf", cfg["render"]["crf"],
-            "-r", media.fps, "-g", look.gop, "-pix_fmt", "yuv420p",
+            "-r", out_fps(media.fps, look.speed), "-g", look.gop, "-pix_fmt", "yuv420p",
             "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709",
             "-map_metadata", "-1", "-map_chapters", "-1", "-movflags", "+faststart", out]
     return cmd
@@ -428,7 +443,8 @@ def limits_from(cfg: dict, profile: str | None) -> palette.Limits:
     return palette.Limits(text_box=tuple(box) if box else None,
                           text_margin=p.get("text_margin", 0.0),
                           max_top=p.get("max_top", 1.0), max_bottom=p.get("max_bottom", 1.0),
-                          max_side=p.get("max_side", 1.0))
+                          max_side=p.get("max_side", 1.0),
+                          max_zoom=p.get("max_zoom", 9.0))
 
 
 def find_looks(srcs: list[Path], levers: set[str], cfg: dict, jobs: int,

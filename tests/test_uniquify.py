@@ -62,7 +62,27 @@ def test_горизонтальное_видео_не_сплющивается()
     graph = build_filter(look, Media(1920, 1080, "25/1", True))
     assert "scale=2112:1188" in graph          # оба измерения ×1.1
     assert "crop=1920:1080:96:54" in graph     # выход того же размера, что исходник
-    assert "fps=25/1" in graph
+    assert "fps=" not in graph                 # кадры не прореживаются под 25/30
+
+
+def test_частота_кадров_меняется_вместе_со_скоростью():
+    from uniquify import out_fps
+
+    assert out_fps("30/1", 1.04) == "156/5"     # 31.2 к/с — ни один кадр не повторяется
+    assert out_fps("30/1", 1.0) == "30/1"
+
+
+def test_тон_и_темп_одним_проходом():
+    from uniquify import Look, audio_filter
+
+    look = Look(look=0, zoom=1.0, ox=0.0, oy=0.0, tilt=0.0, speed=1.04, gop=15, pitch=0.97)
+    af = audio_filter(look)
+    assert "atempo" not in af and af.count("rubberband") == 1 and "tempo=1.04" in af
+
+
+def test_мягкий_профиль_без_сильной_рамки():
+    lim = palette.Limits(max_zoom=1.08)
+    assert all(z <= 1.08 for z, *_ in palette.candidates(False, lim, [VERTICAL]))
 
 
 def test_видео_без_звука_не_требует_дорожку():

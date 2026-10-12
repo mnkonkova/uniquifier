@@ -34,7 +34,7 @@ ZOOMS = (1.03, 1.04, 1.05, 1.06, 1.07, 1.08, 1.09, 1.10, 1.11, 1.12, 1.13, 1.14)
 X_STEP, Y_STEP = 12 / 1080, 24 / 1920
 TILTS = (-0.5, 0.5)
 SAMPLE_WIDTH = 540        # кадры выборки — в этой ширине, пропорции свои
-PALETTE_VERSION = 3       # меняется вместе с правилами перебора — сбрасывает кэш
+PALETTE_VERSION = 4       # меняется вместе с правилами перебора — сбрасывает кэш
 
 
 @dataclass(frozen=True)
@@ -50,6 +50,7 @@ class Limits:
     max_top: float = 1.0
     max_bottom: float = 1.0
     max_side: float = 1.0
+    max_zoom: float = 9.0       # самое сильное приближение рамки («без крайностей»)
 
 
 def even(v: float) -> int:
@@ -114,7 +115,7 @@ def candidates(tilt: bool, lim: Limits, aspects: list[float]) -> list[tuple]:
     tilts = (0.0,) + (TILTS if tilt else ())
     out = []
     for t in tilts:
-        for z in ZOOMS:
+        for z in (z for z in ZOOMS if z <= lim.max_zoom + 1e-9):
             nx = int((z - 1) / X_STEP + 1e-9)
             ny = int((z - 1) / Y_STEP + 1e-9)
             for i in range(nx + 1):
