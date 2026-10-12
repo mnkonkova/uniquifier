@@ -207,3 +207,14 @@ def test_пластинка_без_вокодера():
                 pitch=0.96, voice="vinyl")
     af = audio_filter(look)
     assert "asetrate=48000*0.96" in af and "rubberband" not in af
+
+
+def test_титры_под_новую_скорость(tmp_path):
+    from uniquify import retime_ass
+
+    src = tmp_path / "a.ass"
+    src.write_text("[Events]\nDialogue: 5,0:00:10.40,0:00:20.80,FacePlate,,0,0,0,,{\\pos(96,1300)}ТЕКСТ\n",
+                   encoding="utf-8")
+    out = tmp_path / "b.ass"
+    retime_ass(src, out, 1.04)
+    assert "Dialogue: 5,0:00:10.00,0:00:20.00,FacePlate" in out.read_text(encoding="utf-8")

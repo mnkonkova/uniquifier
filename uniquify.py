@@ -410,7 +410,40 @@ def r3_audio(src: Path, look: Look, work: Path) -> Path | None:
     return out
 
 
-def build_filter(look: Look, media: Media, external_audio: bool = False) -> str:
+_ASS_DIA = re.compile(r"^(Dialogue:\s*\d+,)(\d+:\d\d:\d\d\.\d\d),(\d+:\d\d:\d\d\.\d\d)(,.*)$")
+
+
+def _ass_sec(ts: str) -> float:
+    h, m, sec = ts.split(":")
+    return int(h) * 3600 + int(m) * 60 + float(sec)
+
+
+def _ass_ts(t: float) -> str:
+    h, rem = divmod(max(0.0, t), 3600)
+    m, sec = divmod(rem, 60)
+    return f"{int(h)}:{int(m):02d}:{sec:05.2f}"
+
+
+def retime_ass(src: Path, out: Path, speed: float) -> None:
+    """Титры под новую скорость: все времена ÷ speed (ролик ×1.04 короче на 4%)."""
+    lines = []
+    for ln in src.read_text(encoding="utf-8").splitlines():
+        m = _ASS_DIA.match(ln)
+        if m:
+            ln = (m.group(1) + _ass_ts(_ass_sec(m.group(2)) / speed) + ","
+                  + _ass_ts(_ass_sec(m.group(3)) / speed) + m.group(4))
+        lines.append(ln)
+    out.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def clean_pair(src: Path) -> tuple[Path, Path] | None:
+    """Версия без титров и титры, которые сборщик кладёт в ``_clean/`` рядом."""
+    mp4, ass = src.parent / "_clean" / f"{src.stem}.mp4", src.parent / "_clean" / f"{src.stem}.ass"
+    return (mp4, ass) if mp4.exists() and ass.exists() else None
+
+
+def build_filter(look: Look, media: Media, external_audio: bool = False,
+                 captions: tuple[Path, Path] | None = None) -> str:
     """Рамка в долях кадра: выход того же размера и пропорций, что исходник.
 
     Увеличение — по обеим осям одним множителем, поэтому картинка не
@@ -433,6 +466,10 @@ def build_filter(look: Look, media: Media, external_audio: bool = False) -> str:
     else:
         chain.append(f"scale={w0}:{h0}")
     chain += ["setsar=1", "format=yuv420p"]
+    if captions is not None:
+        # Титры — ПОСЛЕ рамки: кадр приближен и сдвинут, а текст стоит на месте.
+        ass, fonts = captions
+        chain.append(f"ass=filename={ass}:fontsdir={fonts}")
     graph = ",".join(chain) + "[v]"
     if media.has_audio:
         graph += (";[1:a]aresample=48000[a]" if external_audio
@@ -441,10 +478,11 @@ def build_filter(look: Look, media: Media, external_audio: bool = False) -> str:
 
 
 def render_cmd(src: Path, out: Path, look: Look, media: Media, cfg: dict,
-               audio: Path | None = None) -> list:
+               audio: Path | None = None, captions: tuple[Path, Path] | None = None) -> list:
     inputs = ["-i", src] + (["-i", audio] if audio else [])
     cmd = ["ffmpeg", "-y", "-v", "error", *inputs,
-           "-filter_complex", build_filter(look, media, audio is not None), "-map", "[v]"]
+           "-filter_complex", build_filter(look, media, audio is not None, captions),
+           "-map", "[v]"]
     # У сырых файлов звука часто нет — тогда и дорожки в выходе нет.
     if media.has_audio:
         cmd += ["-map", "[a]", "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2"]
@@ -456,10 +494,21 @@ def render_cmd(src: Path, out: Path, look: Look, media: Media, cfg: dict,
 
 
 def render(src: Path, out: Path, look: Look, cfg: dict) -> None:
+    """Собрать ролик. С ``--captions-on-top`` берётся версия без титров из
+    ``_clean/``, а титры накладываются поверх после рамки и под новую скорость."""
+    captions = None
+    fonts = cfg.get("_captions_fonts")
+    pair = clean_pair(src) if fonts else None
+    if pair is not None:
+        src, ass = pair
+        (CACHE / "ass").mkdir(parents=True, exist_ok=True)
+        retimed = CACHE / "ass" / f"{out.stem}.{look.speed}.ass"
+        retime_ass(ass, retimed, look.speed)
+        captions = (retimed, Path(fonts))
     media = probe(src)
     audio = r3_audio(src, look, CACHE / "r3") if media.has_audio else None
     try:
-        sh(render_cmd(src, out, look, media, cfg, audio), f"рендер {src.name}")
+        sh(render_cmd(src, out, look, media, cfg, audio, captions), f"рендер {src.name}")
     finally:
         if audio is not None:
             audio.unlink(missing_ok=True)
@@ -508,6 +557,10 @@ def find_looks(srcs: list[Path], levers: set[str], cfg: dict, jobs: int,
                profile: str | None = None) -> list[tuple]:
     if "frame" not in levers:
         return [IDENTITY]
+    if cfg.get("_captions_fonts"):
+        # Титры кладутся поверх после рамки — облики подбираются по кадрам БЕЗ
+        # титров, и беречь зону титров не нужно.
+        srcs = [clean_pair(p)[0] if clean_pair(p) else p for p in srcs]
     # Облик должен быть безопасен для каждого соотношения сторон в партии.
     aspects = sorted({round(w / h, 4) for w, h in map(palette.video_dims, srcs) if w and h})
     # Выборка для перебора — до 10 роликов, равномерно по списку: в неё попадают
@@ -516,7 +569,11 @@ def find_looks(srcs: list[Path], levers: set[str], cfg: dict, jobs: int,
     sample = srcs[::step][:10]
     print(f"Подбираю облики под материал ({'с наклоном' if 'tilt' in levers else 'без наклона'}, "
           f"выборка {len(sample)} роликов)…", flush=True)
-    looks = palette.search(sample, "tilt" in levers, limits_from(cfg, profile), aspects,
+    lim = limits_from(cfg, profile)
+    if cfg.get("_captions_fonts"):
+        import dataclasses
+        lim = dataclasses.replace(lim, text_box=None)
+    looks = palette.search(sample, "tilt" in levers, lim, aspects,
                            CACHE, jobs=jobs)
     if not looks:
         raise SystemExit("В полях профиля рамки нет облика, который ушёл бы от оригинала "
@@ -941,6 +998,9 @@ def main() -> int:
                                      "(можно срезать зоны интерфейса), raw — сырое видео")
     r.add_argument("--jobs", type=int, default=10, help="процессов для хэширования")
     r.add_argument("--dry-run", action="store_true", help="только показать план")
+    r.add_argument("--captions-on-top", type=Path, metavar="FONTS_DIR",
+                   help="титры поверх ПОСЛЕ рамки: брать версию без титров из <папка>/_clean/ "
+                        "и .ass оттуда же; FONTS_DIR — шрифты титров (montazh/assets/fonts)")
 
     f = sub.add_parser("repair", help="починить собранную версию: пары за порогом пересобрать")
     f.add_argument("version", type=Path, help="папка версии, например output/bot_уник/v1")
@@ -948,9 +1008,12 @@ def main() -> int:
     f.add_argument("--threshold", type=float)
     f.add_argument("--against", type=Path, action="append")
     f.add_argument("--jobs", type=int, default=10)
+    f.add_argument("--captions-on-top", type=Path, metavar="FONTS_DIR")
 
     args = ap.parse_args()
     cfg = yaml.safe_load(args.config.read_text())
+    if getattr(args, "captions_on_top", None):
+        cfg["_captions_fonts"] = str(args.captions_on_top.resolve())
     if args.cmd == "repair":
         return cmd_repair(args, cfg)
     if args.cmd == "capacity":
