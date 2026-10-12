@@ -156,18 +156,18 @@ def test_починка_берёт_ролик_общий_для_нескольк
 
 
 def test_голос_разводит_самую_похожую_пару_дальше_всего():
-    from uniquify import assign_voice, voice_overlap
+    from uniquify import assign_voice, voice_options, voice_overlap
 
     w = [{1: 90.0, 2: 5.0}, {0: 90.0}, {0: 5.0}]
-    v = assign_voice(w, [0, 1, 2], [0.97, 1.03], [0.96, 1.0, 1.04])
+    v = assign_voice(w, [0, 1, 2], voice_options([0.97, 1.03], [0.96, 1.0, 1.04]))
     assert voice_overlap(*v[0], *v[1]) < 0.05
 
 
 def test_шесть_роликов_с_общим_голосом_получают_разные_варианты():
-    from uniquify import assign_voice
+    from uniquify import assign_voice, voice_options
 
     w = [{j: 75.0 for j in range(6) if j != i} for i in range(6)]
-    v = assign_voice(w, list(range(6)), [0.94, 0.97, 1.03, 1.06], [0.96, 1.0, 1.04])
+    v = assign_voice(w, list(range(6)), voice_options([0.94, 0.97, 1.03, 1.06], [0.96, 1.0, 1.04]))
     assert len(set(v.values())) == 6
 
 
@@ -188,3 +188,22 @@ def test_общий_кусок_по_имени_даёт_вес_голосу():
 
 def test_рычаг_тон_по_русски():
     assert parse_levers("рамка,тон") == {"frame", "pitch"}
+
+
+def test_голоса_явным_списком_с_режимами():
+    import yaml
+    from uniquify import voice_menu
+
+    cfg = yaml.safe_load((ROOT / "config_mild.yaml").read_text())
+    opts, modes = voice_menu(cfg, {"pitch", "speed"})
+    assert (0.96, 0.96) in opts and modes[(0.96, 0.96)] == "vinyl"
+    assert modes[(0.97, 1.04)] == "r3" and len(opts) == 5
+
+
+def test_пластинка_без_вокодера():
+    from uniquify import Look, audio_filter
+
+    look = Look(look=0, zoom=1.0, ox=0.0, oy=0.0, tilt=0.0, speed=0.96, gop=15,
+                pitch=0.96, voice="vinyl")
+    af = audio_filter(look)
+    assert "asetrate=48000*0.96" in af and "rubberband" not in af

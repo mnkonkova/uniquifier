@@ -255,26 +255,47 @@ def voice_options(pitches: list[float], speeds: list[float]) -> list[tuple[float
 
 
 def voice_cost(o: tuple[float, float], u: int, weights: Weights,
-               picked: dict[int, tuple[float, float]]) -> float:
+               picked: dict[int, tuple[float, float]], own_weight: float = ORIGINAL_WEIGHT) -> float:
     # Свой оригинал — тоже сосед, с которым ролик делит весь голос.
-    own = ORIGINAL_WEIGHT * voice_overlap(o[0], o[1], 1.0, 1.0)
+    own = own_weight * voice_overlap(o[0], o[1], 1.0, 1.0)
     return own + sum(w * voice_overlap(o[0], o[1], *picked[j])
                      for j, w in weights[u].items() if j in picked)
 
 
-def assign_voice(weights: Weights, chosen: list[int], pitches: list[float],
-                 speeds: list[float]) -> dict[int, tuple[float, float]]:
+def voice_menu(cfg: dict, levers: set[str]) -> tuple[list[tuple[float, float]], dict]:
+    """Варианты голоса (тон, скорость) и способ обработки каждого.
+
+    ``config.yaml → voices`` — явный список ``{pitch, speed, mode}``:
+      r3    — rubberband-r3 --fine, тон с сохранением тембра (без «робота»);
+      vinyl — «пластинка»: темп и тон вместе, без вокодера (pitch = speed).
+    Без списка — все сочетания ступеней ``pitch.levels × speed.levels`` движком r3.
+    """
+    voices = cfg.get("voices")
+    if voices and levers & {"pitch", "speed"}:
+        opts = [(float(v["pitch"]), float(v["speed"])) for v in voices]
+        modes = {(float(v["pitch"]), float(v["speed"])): v.get("mode", "r3") for v in voices}
+        return opts, modes
+    pitches = cfg["pitch"]["levels"] if "pitch" in levers else [1.0]
+    speeds = cfg["speed"]["levels"] if "speed" in levers else [1.0]
+    opts = voice_options(pitches, speeds)
+    return opts, {o: "r3" for o in opts}
+
+
+def assign_voice(weights: Weights, chosen: list[int],
+                 options: list[tuple[float, float]]) -> dict[int, tuple[float, float]]:
     """(тон, скорость) каждому ролику: у похожих по звуку — как можно дальше.
 
     Жадно, от самых «нагруженных» роликов: пара ступеней, при которой сумма
     оставшейся похожести с уже раздавшими соседями минимальна.
     """
-    options = voice_options(pitches, speeds)
     order = sorted(chosen, key=lambda i: -sum(weights[i].values()))
     picked: dict[int, tuple[float, float]] = {}
     used = {o: 0 for o in options}
     for u in order:
-        best = min(options, key=lambda o: (round(voice_cost(o, u, weights, picked), 6),
+        # Близость к оригиналу здесь — только запрет (voice_options отсекает
+        # слишком близкие), а не вес: с весом все ролики без соседей получали
+        # один и тот же самый далёкий голос (на примерах — три «пластинки»).
+        best = min(options, key=lambda o: (round(voice_cost(o, u, weights, picked, 0.0), 6),
                                            used[o], options.index(o)))
         picked[u] = best
         used[best] += 1
@@ -293,6 +314,9 @@ class Look:
     speed: float
     gop: int
     pitch: float = 1.0
+    # Как менять голос: r3 (rubberband-r3 --fine), vinyl («пластинка»),
+    # r2 — прежний фильтр ffmpeg (старые планы; давал «робо-эхо»).
+    voice: str = "r2"
 
     @classmethod
     def from_plan(cls, d: dict) -> "Look":
@@ -349,7 +373,12 @@ def out_fps(src_fps: str, speed: float) -> str:
 
 
 def audio_filter(look: Look) -> str:
-    """Темп и тон ОДНИМ проходом rubberband.
+    """Фильтр звука для ffmpeg (r2 и vinyl; r3 обрабатывается до ffmpeg — ``r3_audio``).
+
+    vinyl — «пластинка»: частота дискретизации ×pitch, без вокодера — ни эха,
+    ни «робота»; темп и тон меняются вместе (в списке голосов pitch = speed).
+
+    r2 — темп и тон ОДНИМ проходом rubberband из ffmpeg.
 
     Раньше темп менял atempo, а тон — rubberband отдельно: два растяжения
     подряд, и на крайних значениях (тон ±6%, скорость ±8%) голос давал
@@ -358,11 +387,30 @@ def audio_filter(look: Look) -> str:
     """
     if look.pitch == 1.0 and look.speed == 1.0:
         return "aresample=48000"
+    if look.voice == "vinyl":
+        return f"aresample=48000,asetrate=48000*{look.pitch},aresample=48000"
     return (f"rubberband=tempo={look.speed}:pitch={look.pitch}:formant=preserved:"
             f"pitchq=quality,aresample=48000")
 
 
-def build_filter(look: Look, media: Media) -> str:
+def r3_audio(src: Path, look: Look, work: Path) -> Path | None:
+    """Голос движком R3 (``rubberband-r3 --fine --formant``) — отдельным шагом:
+    в ffmpeg есть только движок R2, а он с сохранением тембра звучит «роботом»
+    (сравнение на слух, 2026-10-12). Возвращает wav или None, если не нужно."""
+    if look.voice != "r3" or (look.pitch == 1.0 and look.speed == 1.0):
+        return None
+    work.mkdir(parents=True, exist_ok=True)
+    raw = work / f"{src.stem}.{look.pitch}_{look.speed}.in.wav"
+    out = work / f"{src.stem}.{look.pitch}_{look.speed}.r3.wav"
+    sh(["ffmpeg", "-y", "-v", "error", "-i", src, "-vn", "-ac", "2", "-ar", "48000",
+        "-c:a", "pcm_s16le", raw], f"звук {src.name}")
+    sh(["rubberband-r3", "--fine", "--formant", "-T", look.speed, "-f", look.pitch, raw, out],
+       f"rubberband-r3 {src.name}")
+    raw.unlink(missing_ok=True)
+    return out
+
+
+def build_filter(look: Look, media: Media, external_audio: bool = False) -> str:
     """Рамка в долях кадра: выход того же размера и пропорций, что исходник.
 
     Увеличение — по обеим осям одним множителем, поэтому картинка не
@@ -387,13 +435,16 @@ def build_filter(look: Look, media: Media) -> str:
     chain += ["setsar=1", "format=yuv420p"]
     graph = ",".join(chain) + "[v]"
     if media.has_audio:
-        graph += f";[0:a]{audio_filter(look)}[a]"
+        graph += (";[1:a]aresample=48000[a]" if external_audio
+                  else f";[0:a]{audio_filter(look)}[a]")
     return graph
 
 
-def render_cmd(src: Path, out: Path, look: Look, media: Media, cfg: dict) -> list:
-    cmd = ["ffmpeg", "-y", "-v", "error", "-i", src,
-           "-filter_complex", build_filter(look, media), "-map", "[v]"]
+def render_cmd(src: Path, out: Path, look: Look, media: Media, cfg: dict,
+               audio: Path | None = None) -> list:
+    inputs = ["-i", src] + (["-i", audio] if audio else [])
+    cmd = ["ffmpeg", "-y", "-v", "error", *inputs,
+           "-filter_complex", build_filter(look, media, audio is not None), "-map", "[v]"]
     # У сырых файлов звука часто нет — тогда и дорожки в выходе нет.
     if media.has_audio:
         cmd += ["-map", "[a]", "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2"]
@@ -405,7 +456,13 @@ def render_cmd(src: Path, out: Path, look: Look, media: Media, cfg: dict) -> lis
 
 
 def render(src: Path, out: Path, look: Look, cfg: dict) -> None:
-    sh(render_cmd(src, out, look, probe(src), cfg), f"рендер {src.name}")
+    media = probe(src)
+    audio = r3_audio(src, look, CACHE / "r3") if media.has_audio else None
+    try:
+        sh(render_cmd(src, out, look, media, cfg, audio), f"рендер {src.name}")
+    finally:
+        if audio is not None:
+            audio.unlink(missing_ok=True)
 
 
 def next_version(base: Path) -> Path:
@@ -485,16 +542,16 @@ def make_looks(raw: Weights, assign: dict[int, int], looks: list[tuple],
                levers: set[str], cfg: dict, stems: list[str]) -> dict[int, Look]:
     # Голос раздаётся по ПОЛНОМУ графу сходства, а не по графу «выше порога»:
     # общий хук звучит одинаково и у пар, которые картинкой уже разведены.
-    pitches = cfg["pitch"]["levels"] if "pitch" in levers else [1.0]
-    speeds = cfg["speed"]["levels"] if "speed" in levers else [1.0]
-    voice = assign_voice(voice_weights(raw, stems), list(assign), pitches, speeds)
+    options, modes = voice_menu(cfg, levers)
+    voice = assign_voice(voice_weights(raw, stems), list(assign), options)
     out = {}
     for n, i in enumerate(sorted(assign)):
         c = assign[i]
         z, ox, oy, t = looks[c]
         pitch, speed = voice[i]
         out[i] = Look(look=c if "frame" in levers else -1, zoom=z, ox=ox, oy=oy, tilt=t,
-                      speed=speed, gop=15 + (n * 5) % 11, pitch=pitch)
+                      speed=speed, gop=15 + (n * 5) % 11, pitch=pitch,
+                      voice=modes.get((pitch, speed), "r3"))
     return out
 
 
@@ -643,10 +700,9 @@ def gate_and_repair(out: Path, folders: list[Path], srcs: list[Path], per: dict[
             if not failed or rnd == REPAIR_ROUNDS:
                 break
             vw = voice_weights(similar(), [p.stem for p in srcs])
-            pitches = cfg["pitch"]["levels"] if "pitch" in levers else [1.0]
-            speeds = cfg["speed"]["levels"] if "speed" in levers else [1.0]
+            options, modes = voice_menu(cfg, levers)
             rows = json.loads(audio_report.read_text())
-            changed = optimize_voice(per, rows, by_label, multi, vw, pitches, speeds, limit)
+            changed = optimize_voice(per, rows, by_label, multi, vw, options, modes, limit)
             if not changed:
                 print("Перебор голосов не нашёл улучшения — оставшиеся пары не разводятся.",
                       flush=True)
@@ -716,8 +772,8 @@ def run_audio_gate(folders: list[Path], originals: list[Path] | None, report: Pa
 
 
 def optimize_voice(per: dict[int, Look], rows: list[dict], by_label: dict[str, int],
-                   multi: bool, fallback: Weights, pitches: list[float], speeds: list[float],
-                   limit: float, passes: int = 30) -> set[int]:
+                   multi: bool, fallback: Weights, options: list[tuple[float, float]],
+                   modes: dict, limit: float, passes: int = 30) -> set[int]:
     """Перебор голосов по ЗАМЕРЕННОМУ сходству — без пересборки, в расчёте.
 
     Отчёт гейта даёт сходство каждой пары с общим голосом при её нынешних
@@ -732,7 +788,6 @@ def optimize_voice(per: dict[int, Look], rows: list[dict], by_label: dict[str, i
     629 пар → 602 после круга — перекрашенный ролик садился на соседей.
     """
     target = limit * 0.8
-    options = voice_options(pitches, speeds)
     cur = {i: (l.pitch, l.speed) for i, l in per.items()}
     base: dict[int, dict[int, float]] = {}
     hot: set[int] = set()
@@ -780,24 +835,9 @@ def optimize_voice(per: dict[int, Look], rows: list[dict], by_label: dict[str, i
     for i in changed:
         old = per[i]
         per[i] = Look(look=old.look, zoom=old.zoom, ox=old.ox, oy=old.oy, tilt=old.tilt,
-                      speed=cur[i][1], gop=old.gop, pitch=cur[i][0])
+                      speed=cur[i][1], gop=old.gop, pitch=cur[i][0],
+                      voice=modes.get(cur[i], "r3"))
     return changed
-
-
-def revoice(i: int, per: dict[int, Look], weights: Weights, partners: set[int],
-            pitches: list[float], speeds: list[float]) -> Look:
-    """Другие тон и скорость: меньше всего общего с соседями и оригиналом.
-
-    Сочетания пар, с которыми ролик только что не прошёл, исключаются.
-    """
-    picked = {j: (per[j].pitch, per[j].speed) for j in per if j != i}
-    banned = {picked[j] for j in partners if j in picked} | {(per[i].pitch, per[i].speed)}
-    options = [o for o in voice_options(pitches, speeds) if o not in banned] \
-        or voice_options(pitches, speeds)
-    pitch, speed = min(options, key=lambda o: voice_cost(o, i, weights, picked))
-    old = per[i]
-    return Look(look=old.look, zoom=old.zoom, ox=old.ox, oy=old.oy, tilt=old.tilt,
-                speed=speed, gop=old.gop, pitch=pitch)
 
 
 def _stem(report_label: str, multi: bool) -> str:
@@ -838,7 +878,7 @@ def relook(i: int, per: dict[int, Look], looks: list[tuple], weights: Weights,
     c = min(options, key=lambda k: (cost[k], k))
     z, ox, oy, t = looks[c]
     return Look(look=c, zoom=z, ox=ox, oy=oy, tilt=t, speed=per[i].speed, gop=per[i].gop,
-                pitch=per[i].pitch)
+                pitch=per[i].pitch, voice=per[i].voice)
 
 
 def save_plan(out: Path, per: dict[int, Look], srcs: list[Path], multi: bool) -> None:
